@@ -1,0 +1,261 @@
+{
+  "metadata": {
+    "duration": 6825.6587,
+    "channels": 1,
+    "model_info": {
+      "a23df42c-f390-4a31-90b9-c73ec96cf274": {
+        "name": "general-nova-3",
+        "version": "2026-08-03.21876",
+        "arch": "nova-3"
+      }
+    }
+  },
+  "results": {
+    "channels": [
+      {
+        "alternatives": [
+          {
+            "transcript": "",
+            "confidence": 0.96972656,
+            "words": [
+              {
+                "word": "технологически",
+                "punctuated_word": "технологически",
+                "start": 9.599999,
+                "end": 10.32,
+                "confidence": 0.9770508,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "по",
+                "punctuated_word": "по",
+                "start": 10.32,
+                "end": 10.88,
+                "confidence": 0.38623047,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "всем",
+                "punctuated_word": "всем",
+                "start": 10.88,
+                "end": 11.2,
+                "confidence": 1.0,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "остальным",
+                "punctuated_word": "остальным",
+                "start": 11.2,
+                "end": 11.599999,
+                "confidence": 1.0,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "критериям",
+                "punctuated_word": "критериям",
+                "start": 11.599999,
+                "end": 12.16,
+                "confidence": 0.92366534,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "он",
+                "punctuated_word": "он",
+                "start": 12.16,
+                "end": 12.32,
+                "confidence": 0.97509766,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "будет",
+                "punctuated_word": "будет",
+                "start": 12.32,
+                "end": 13.92,
+                "confidence": 1.0,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "идеальный",
+                "punctuated_word": "идеальный,",
+                "start": 12.845,
+                "end": 13.405001,
+                "confidence": 0.75056964,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "прям",
+                "punctuated_word": "прям",
+                "start": 13.405001,
+                "end": 13.645,
+                "confidence": 0.5517578,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "всем",
+                "punctuated_word": "всем",
+                "start": 13.645,
+                "end": 14.6050005,
+                "confidence": 0.88134766,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "современным",
+                "punctuated_word": "современным",
+                "start": 14.6050005,
+                "end": 15.245001,
+                "confidence": 0.99853516,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "тенденциям",
+                "punctuated_word": "тенденциям",
+                "start": 15.245001,
+                "end": 16.125,
+                "confidence": 0.9342448,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "и",
+                "punctuated_word": "и",
+                "start": 16.125,
+                "end": 16.205,
+                "confidence": 0.9970703,
+                "speaker": 0,
+                "speaker_confidence": 1.0
+              },
+              {
+                "word": "с",
+                "punctuated_word": "с",
+                "start": 4726.815,
+                "end": 4726.975,
+                "confidence": 0.47387695,
+                "speaker": 1,
+                "speaker_confidence": 0.73296577
+              },
+              {
+                "word": "этим",
+                "punctuated_word": "этим",
+                "start": 4726.975,
+                "end": 4727.055,
+                "confidence": 0.9267578,
+                "speaker": 1,
+                "speaker_confidence": 0.73296577
+              },
+              {
+                "word": "нету",
+                "punctuated_word": "нету.",
+                "start": 4727.055,
+                "end": 4727.455,
+                "confidence": 0.63964844,
+                "speaker": 1,
+                "speaker_confidence": 0.73296577
+              },
+              {
+                "word": "но",
+                "punctuated_word": "Но",
+                "start": 4727.455,
+                "end": 4728.175,
+                "confidence": 0.9819336,
+                "speaker": 1,
+                "speaker_confidence": 0.57640445
+              },
+              {
+                "word": "я",
+                "punctuated_word": "я,",
+                "start": 4728.415,
+                "end": 4728.815,
+                "confidence": 0.9580078,
+                "speaker": 1,
+                "speaker_confidence": 0.7578475
+              },
+              {
+                "word": "допустим",
+                "punctuated_word": "допустим,",
+                "start": 4728.815,
+                "end": 4729.2153,
+                "confidence": 0.99609375,
+                "speaker": 1,
+                "speaker_confidence": 0.7578475
+              },
+              {
+                "word": "агентом",
+                "punctuated_word": "агентом",
+                "start": 4729.2153,
+                "end": 4729.2153,
+                "confidence": 0.99365234,
+                "speaker": 1,
+                "speaker_confidence": 0.7578475
+              },
+              {
+                "word": "это",
+                "punctuated_word": "это",
+                "start": 4730.27,
+                "end": 4730.5103,
+                "confidence": 0.72216797,
+                "speaker": 1,
+                "speaker_confidence": 0.83646846
+              },
+              {
+                "word": "крутая",
+                "punctuated_word": "крутая",
+                "start": 4730.5103,
+                "end": 4730.91,
+                "confidence": 0.9995117,
+                "speaker": 1,
+                "speaker_confidence": 0.83646846
+              },
+              {
+                "word": "вещь",
+                "punctuated_word": "вещь,",
+                "start": 4730.91,
+                "end": 4731.31,
+                "confidence": 0.80371094,
+                "speaker": 1,
+                "speaker_confidence": 0.83646846
+              },
+              {
+                "word": "понимаю",
+                "punctuated_word": "понимаю,",
+                "start": 4731.31,
+                "end": 4731.5503,
+                "confidence": 0.48388672,
+                "speaker": 1,
+                "speaker_confidence": 0.83646846
+              },
+              {
+                "word": "что",
+                "punctuated_word": "что,",
+                "start": 4731.5503,
+                "end": 4731.87,
+                "confidence": 0.87768555,
+                "speaker": 1,
+                "speaker_confidence": 0.83646846
+              },
+              {
+                "word": "блин",
+                "punctuated_word": "блин,",
+                "start": 4731.87,
+                "end": 4732.6704,
+                "confidence": 0.78027344,
+                "speaker": 1,
+                "speaker_confidence": 0.83646846
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

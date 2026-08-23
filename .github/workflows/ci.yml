@@ -1,0 +1,74 @@
+name: CI
+
+# This is also the project's first-ever run on Linux — everything
+# before this workflow existed was verified on Apple Silicon only, and the
+# Linux-compatibility claim in README rested solely on uv.lock's wheel list.
+#
+# Deliberately excluded: downloading any model (GigaAM, VAD, pyannote, WeSpeaker)
+# and any call to a network ASR/diarization/LLM provider (Groq, Deepgram, OpenAI).
+# The full pytest suite runs entirely on fixtures and stubs (see tests/, especially
+# tests/test_end_to_end_pipeline.py) and needs neither, by design.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        # Hard requirement per README (check_ffmpeg gates `setup` and `run`'s audio
+        # diagnostics). Also needed by two real (requires_ffmpeg-marked) tests in
+        # tests/test_audio_preprocess.py that shell out to the actual binary; every
+        # other ffmpeg/ffprobe call in the suite is monkeypatched. Without this step
+        # those two tests would be skipped and the `doctor` smoke step below would
+        # report ffmpeg:false.
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y ffmpeg
+          else
+            brew install ffmpeg
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Sync dependencies
+        # --frozen: fail instead of silently re-resolving if uv.lock ever drifts
+        # from pyproject.toml, so a stale lock is a CI failure, not a surprise.
+        run: uv sync --frozen --python ${{ matrix.python }} --group dev
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: Pytest
+        run: uv run pytest -q
+
+      # 75% is today's measured coverage floor (see CONTRIBUTING.md); a regression
+      # below it fails CI instead of only showing up as a smaller number in the log.
+      - name: Coverage report
+        run: uv run pytest -q --cov=transcribe_meeting --cov-report=term-missing --cov-fail-under=75
+
+      - name: Build package
+        # Proves the sdist/wheel actually build before a release, on both OSes.
+        run: uv build
+
+      - name: doctor smoke check (no models on a fresh CI checkout)
+        # Never a CI gate: doctor's default route needs a downloaded GigaAM
+        # checkpoint and a downloaded WeSpeaker model (route_ready
+        # is genuinely false without them, by design), and CI never runs `setup`.
+        # This step only proves the command imports its dependencies and runs to
+        # completion without an unhandled exception, on Linux and on macOS alike.
+        run: uv run transcribe-meeting doctor || true

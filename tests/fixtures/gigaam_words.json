@@ -1,0 +1,222 @@
+{
+  "words": [
+    {
+      "end": 0.4706814524714829,
+      "probability": null,
+      "start": 0.1109167186311787,
+      "word": "тоеть"
+    },
+    {
+      "end": 0.7904723269961977,
+      "probability": null,
+      "start": 0.590603030418251,
+      "word": "даже"
+    },
+    {
+      "end": 1.1102632015209126,
+      "probability": null,
+      "start": 0.9103939049429658,
+      "word": "самая"
+    },
+    {
+      "end": 1.7898188098859316,
+      "probability": null,
+      "start": 1.510001794676806,
+      "word": "крутая"
+    },
+    {
+      "end": 2.229531262357414,
+      "probability": null,
+      "start": 1.9097403878326997,
+      "word": "система"
+    },
+    {
+      "end": 2.749191433460076,
+      "probability": null,
+      "start": 2.5093482775665397,
+      "word": "самый"
+    },
+    {
+      "end": 3.1489300266159694,
+      "probability": null,
+      "start": 2.8291391520912548,
+      "word": "крутой"
+    },
+    {
+      "end": 3.548668619771863,
+      "probability": null,
+      "start": 3.228877745247148,
+      "word": "продукт"
+    },
+    {
+      "end": 4.188250368821293,
+      "probability": null,
+      "start": 3.988381072243346,
+      "word": "может"
+    },
+    {
+      "end": 4.867805977186312,
+      "probability": null,
+      "start": 4.7079105399239545,
+      "word": "быть"
+    },
+    {
+      "end": 5.387466148288973,
+      "probability": null,
+      "start": 4.94775369581749,
+      "word": "абсолютно"
+    },
+    {
+      "end": 6.027047897338403,
+      "probability": null,
+      "start": 5.467413866920152,
+      "word": "бесполезным"
+    },
+    {
+      "end": 6.146969475285171,
+      "probability": null,
+      "start": 6.1069956159695815,
+      "word": "и"
+    },
+    {
+      "end": 6.866498942965779,
+      "probability": null,
+      "start": 6.22691719391635,
+      "word": "неэффективен"
+    },
+    {
+      "end": 7.026394380228137,
+      "probability": null,
+      "start": 6.946446661596958,
+      "word": "ну"
+    },
+    {
+      "end": 7.266237536121673,
+      "probability": null,
+      "start": 7.106342098859315,
+      "word": "если"
+    },
+    {
+      "end": 7.626002269961977,
+      "probability": null,
+      "start": 7.586028410646388,
+      "word": "у"
+    },
+    {
+      "end": 8.265584019011408,
+      "probability": null,
+      "start": 7.705949988593155,
+      "word": "пользователя"
+    },
+    {
+      "end": 8.505427174904943,
+      "probability": null,
+      "start": 8.385505596958176,
+      "word": "его"
+    },
+    {
+      "end": 8.665322612167301,
+      "probability": null,
+      "start": 8.585374893536123,
+      "word": "не"
+    },
+    {
+      "end": 8.945139627376427,
+      "probability": null,
+      "start": 8.70529647148289,
+      "word": "будет"
+    },
+    {
+      "end": 9.184982783269962,
+      "probability": null,
+      "start": 9.025087346007606,
+      "word": "хотя"
+    },
+    {
+      "end": 9.464799798479088,
+      "probability": null,
+      "start": 9.26493050190114,
+      "word": "может"
+    },
+    {
+      "end": 10.304250844106464,
+      "probability": null,
+      "start": 9.624695235741445,
+      "word": "технологически"
+    },
+    {
+      "end": 10.664015577946769,
+      "probability": null,
+      "start": 10.544094000000001,
+      "word": "там"
+    },
+    {
+      "end": 10.863884874524716,
+      "probability": null,
+      "start": 10.783937155893536,
+      "word": "по"
+    },
+    {
+      "end": 11.103728030418251,
+      "probability": null,
+      "start": 10.943832593155895,
+      "word": "всем"
+    },
+    {
+      "end": 11.663362060836503,
+      "probability": null,
+      "start": 11.22364960836502,
+      "word": "остальным"
+    },
+    {
+      "end": 12.183022231939164,
+      "probability": null,
+      "start": 11.703335920152092,
+      "word": "критериям"
+    },
+    {
+      "end": 12.382891528517112,
+      "probability": null,
+      "start": 12.302943809885932,
+      "word": "он"
+    },
+    {
+      "end": 12.662708543726236,
+      "probability": null,
+      "start": 12.46283924714829,
+      "word": "будет"
+    },
+    {
+      "end": 13.302290292775666,
+      "probability": null,
+      "start": 12.822603980988594,
+      "word": "идеальный"
+    },
+    {
+      "end": 13.422211870722434,
+      "probability": null,
+      "start": 13.382238011406844,
+      "word": "и"
+    },
+    {
+      "end": 13.66205502661597,
+      "probability": null,
+      "start": 13.502159589353614,
+      "word": "прям"
+    },
+    {
+      "end": 13.901898182509507,
+      "probability": null,
+      "start": 13.781976604562738,
+      "word": "вот"
+    }
+  ],
+  "run_parameters": {
+    "backend": "gigaam",
+    "device": "mps",
+    "model": "multilingual_large_ctc",
+    "output_schema_version": 3,
+    "provider": "local",
+    "word_timestamps": true
+  }
+}
