@@ -1,0 +1,15 @@
+.venv/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+*.egg-info/
+# Created inside the checkout when the data-root env vars are unset.
+output/
+models/
+models.lock.json
+.pytest_cache/
+.ruff_cache/
+.coverage
+.DS_Store
