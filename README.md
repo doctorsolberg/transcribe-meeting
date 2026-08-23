@@ -9,8 +9,29 @@ default through **two** GigaAM models — `multilingual_large_ctc` and
 (for details and the alternative `pyannote` route, see "Diarization: Two
 Routes").
 
+## Language support
+
+This project is built for **Russian speech**. The default route is Russian-only:
+GigaAM accepts `--language ru` or `auto` and nothing else, and both text-cleanup
+stages are tuned for Russian — the filler list `light` strips is Russian, and the
+fusion prompt `readable` sends to the LLM is written in Russian, with Russian
+examples of the exact mistakes these models make.
+
+Other languages work through the network routes. `--asr-models
+groq-whisper-large-v3` takes any language Whisper supports, and
+`--asr-models deepgram-nova-3` covers 45+ languages, with `--language auto`
+switching nova-3 into code-switching mode across ten of them. Diarization is
+language-independent on every route.
+
+What to expect outside Russian: transcription is as good as the provider you
+picked, `raw` is fine, but `light` will leave foreign fillers in place and
+`readable` will be working against a prompt that argues about Russian morphology.
+Use `--clean raw` there, or adapt `READABLE_FUSION_INSTRUCTIONS` in
+`transcribe_meeting/readable.py` to your language.
+
 ## Table of Contents
 
+- [Language support](#language-support)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick Start](#quick-start)

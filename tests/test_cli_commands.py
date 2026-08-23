@@ -12,6 +12,7 @@ validation before create_job runs, so nothing here mocks network/model code.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,24 @@ from typer.testing import CliRunner
 from transcribe_meeting.cli import app
 
 runner = CliRunner()
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+#: Unicode box-drawing block: the frame rich puts around its panels and tables.
+_BOX = re.compile(r"[\u2500-\u257f]")
+
+
+def plain(output: str) -> str:
+    """Strip rich's presentation so an assertion checks the message, not the layout.
+
+    Rich colours its error boxes and hard-wraps them to the terminal width, and it
+    makes both choices differently on a CI runner than on a developer's machine —
+    which is exactly how four of these assertions passed locally and failed in CI.
+    Escape codes land inside styled option names; a wrap splits a substring and
+    leaves the box border sitting in the middle of it ("setup │ │ --asr-models").
+    """
+    without_box = _BOX.sub("", _ANSI.sub("", output))
+    return re.sub(r"\s+", " ", without_box)
+
 
 SECRET_ENV_NAMES = ("OPENAI_API_KEY", "GROQ_API_KEY", "DEEPGRAM_API_KEY", "HF_TOKEN")
 
@@ -103,7 +122,7 @@ def test_doctor_without_models_reports_not_ready_with_advice_only_on_stderr():
     checks = json.loads(result.stdout)
     assert checks["route_ready"] is False
     assert result.exit_code == 1
-    assert "Traceback" not in result.output
+    assert "Traceback" not in plain(result.output)
     assert "setup" in result.stderr
 
 
@@ -114,7 +133,7 @@ def test_run_rejects_an_undownloaded_local_asr_model():
     result = runner.invoke(app, ["run", "missing.wav", "--meeting-name", "t"])
 
     assert result.exit_code == 2
-    assert "setup --asr-models" in result.output
+    assert "setup --asr-models" in plain(result.output)
 
 
 def test_run_rejects_pyannote_diarization_without_community_1():
@@ -123,7 +142,7 @@ def test_run_rejects_pyannote_diarization_without_community_1():
     )
 
     assert result.exit_code == 2
-    assert "setup --diarization-provider pyannote" in result.output
+    assert "setup --diarization-provider pyannote" in plain(result.output)
 
 
 def test_run_degrades_a_missing_deepgram_asr_key_with_a_warning_not_a_refusal():
@@ -136,11 +155,11 @@ def test_run_degrades_a_missing_deepgram_asr_key_with_a_warning_not_a_refusal():
         app, ["run", "missing.wav", "--meeting-name", "t", "--asr-models", "deepgram-nova-3"]
     )
 
-    assert "ASR: deepgram-nova-3 skipped" in result.output
-    assert "DEEPGRAM_API_KEY is missing" in result.output
+    assert "ASR: deepgram-nova-3 skipped" in plain(result.output)
+    assert "DEEPGRAM_API_KEY is missing" in plain(result.output)
     # It was dropped (leaving zero models), not refused outright: the eventual
     # error is the "no models left" message, not the diarization-style hard block.
-    assert "No ASR models are left" in result.output
+    assert "No ASR models are left" in plain(result.output)
     assert result.exit_code == 2
 
 
@@ -150,8 +169,8 @@ def test_run_refuses_deepgram_diarization_without_a_key():
     )
 
     assert result.exit_code == 2
-    assert "auth set deepgram" in result.output
-    assert "DEEPGRAM_API_KEY" in result.output
+    assert "auth set deepgram" in plain(result.output)
+    assert "DEEPGRAM_API_KEY" in plain(result.output)
 
 
 def test_run_rejects_more_than_three_asr_models():
@@ -168,7 +187,7 @@ def test_run_rejects_more_than_three_asr_models():
     )
 
     assert result.exit_code == 2
-    assert "No more than three" in result.output
+    assert "No more than three" in plain(result.output)
 
 
 def test_run_rejects_an_unknown_asr_model_name():
@@ -177,7 +196,7 @@ def test_run_rejects_an_unknown_asr_model_name():
     )
 
     assert result.exit_code == 2
-    assert "Unknown ASR models" in result.output
+    assert "Unknown ASR models" in plain(result.output)
 
 
 def test_run_rejects_zero_speakers(tmp_path, monkeypatch):
@@ -186,7 +205,7 @@ def test_run_rejects_zero_speakers(tmp_path, monkeypatch):
     result = runner.invoke(app, ["run", "missing.wav", "--meeting-name", "t", "--speakers", "0"])
 
     assert result.exit_code == 2
-    assert "must be at least 1" in result.output
+    assert "must be at least 1" in plain(result.output)
 
 
 def test_run_rejects_a_nonexistent_input_file_once_the_route_is_ready(tmp_path, monkeypatch):
@@ -197,8 +216,8 @@ def test_run_rejects_a_nonexistent_input_file_once_the_route_is_ready(tmp_path, 
     result = runner.invoke(app, ["run", "definitely-missing.wav", "--meeting-name", "t"])
 
     assert result.exit_code == 2
-    assert "Missing files" in result.output
-    assert "definitely-missing.wav" in result.output
+    assert "Missing files" in plain(result.output)
+    assert "definitely-missing.wav" in plain(result.output)
 
 
 # --- 4. run with valid args but missing audio creates no job directory ------------
@@ -223,7 +242,7 @@ def test_rename_on_a_nonexistent_job_is_a_clear_error_not_a_traceback(tmp_path):
 
     result = runner.invoke(app, ["rename", str(missing_job), "--set", "SPEAKER_00=Igor"])
 
-    assert "Traceback" not in result.output
+    assert "Traceback" not in plain(result.output)
     assert result.exit_code == 2
     assert result.exception is None or isinstance(result.exception, SystemExit)
 
@@ -235,13 +254,14 @@ def test_refine_on_a_nonexistent_job_is_a_clear_error_not_a_traceback(tmp_path):
 
     result = runner.invoke(app, ["refine", str(missing_job), str(review_csv)])
 
-    assert "Traceback" not in result.output
+    assert "Traceback" not in plain(result.output)
     assert result.exit_code == 2
     assert result.exception is None or isinstance(result.exception, SystemExit)
-    # The Rich error box wraps long paths across lines, so check the job name
-    # rather than the full path as one unbroken substring.
-    assert "does-not-exist" in result.output
-    assert "not found" in result.output
+    # Not the path: rich breaks a long unbroken token mid-word to fit its box, so no
+    # amount of normalising makes a filesystem path a reliable substring. The wording
+    # of the message is what this test is actually about.
+    assert "Job folder not found" in plain(result.output)
+    assert "not found" in plain(result.output)
 
 
 def test_refine_on_an_existing_job_with_a_missing_csv_is_a_bad_parameter_not_a_traceback(
@@ -253,18 +273,18 @@ def test_refine_on_an_existing_job_with_a_missing_csv_is_a_bad_parameter_not_a_t
 
     result = runner.invoke(app, ["refine", str(job_dir), str(missing_csv)])
 
-    assert "Traceback" not in result.output
-    assert "FileNotFoundError" not in result.output
+    assert "Traceback" not in plain(result.output)
+    assert "FileNotFoundError" not in plain(result.output)
     assert result.exit_code == 2
     assert result.exception is None or isinstance(result.exception, SystemExit)
 
 
 def _assert_clear_error_not_a_traceback(result):
-    assert "Traceback" not in result.output
-    assert "FileNotFoundError" not in result.output
+    assert "Traceback" not in plain(result.output)
+    assert "FileNotFoundError" not in plain(result.output)
     assert result.exit_code == 2
     assert result.exception is None or isinstance(result.exception, SystemExit)
-    assert "not found" in result.output
+    assert "not found" in plain(result.output)
 
 
 def test_clean_on_a_nonexistent_job_is_a_clear_error_not_a_traceback(tmp_path):
@@ -307,8 +327,8 @@ def test_status_on_an_old_format_manifest_gives_a_readable_report_not_a_keyerror
 
     result = runner.invoke(app, ["status", str(job_dir)])
 
-    assert "Traceback" not in result.output
-    assert "KeyError" not in result.output
+    assert "Traceback" not in plain(result.output)
+    assert "KeyError" not in plain(result.output)
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload["job"] == "old-job"
@@ -391,7 +411,7 @@ def test_a_usage_error_after_the_run_stays_a_usage_error(tmp_path, monkeypatch):
 
     # Exit code 2 is click's usage error; 1 would mean the broad handler caught it.
     assert result.exit_code == 2, result.output
-    assert "--speaker-names" in result.output
+    assert "--speaker-names" in plain(result.output)
     assert not (job_holder["job"] / "error.log").exists()
 
 
@@ -409,4 +429,4 @@ def test_run_refuses_when_the_working_files_would_not_fit(tmp_path, monkeypatch)
     result = runner.invoke(app, ["run", str(audio), "--meeting-name", "test", "--clean", "raw"])
 
     assert result.exit_code == 2, result.output
-    assert "Not enough space" in result.output
+    assert "Not enough space" in plain(result.output)
