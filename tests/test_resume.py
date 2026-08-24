@@ -1,4 +1,11 @@
+import pytest
+from typer.testing import CliRunner
+
+from transcribe_meeting.cli import app
 from transcribe_meeting.core import asr_stage_fingerprint, complete_stage, stage_valid
+from transcribe_meeting.model import Utterance
+from transcribe_meeting.readable import ReadableResult
+from transcribe_meeting.util import atomic_json, read_json
 
 
 def test_stage_cache_is_invalidated_by_changed_fingerprint(tmp_path):
@@ -69,3 +76,171 @@ def test_a_changed_tuple_fingerprint_is_still_rejected(tmp_path):
     assert not stage_valid(
         tmp_path, "audio", {"sources": [("hash-a", 999.0)], "config": {"language": "ru"}}
     )
+
+
+# --- resume finishes the readable pass the job was configured for -------------------
+#
+# The LLM pass lives outside run_job and has no `.stages/` marker, so nothing in the
+# fingerprint machinery above can tell resume whether it still has to run. Interrupt
+# a job before it and resume used to finish the local stages, print "Done" and leave
+# the job without transcript.readable.md forever — the only trace was a warning
+# buried in result.json. These tests drive the real `resume` command with run_job
+# stubbed out (the local stages are already checkpointed by the time this matters)
+# and only the OpenAI call replaced.
+
+
+def _readable_job(tmp_path, modes=("raw", "light", "readable"), readable_block=None):
+    """A job whose local stages are done: canonical.json exists, readable does not."""
+    job = tmp_path / "job"
+    job.mkdir()
+    manifest = {
+        "job_id": "job",
+        "meeting_name": "test",
+        "sources": [{"path": "/x/a.m4a", "duration": 60.0}],
+        "glossary": [],
+        "config": {
+            "clean": list(modes),
+            "llm_model": "gpt-test",
+            "context_prompt": "",
+            "asr_models": ["v3_rnnt"],
+        },
+    }
+    if readable_block is not None:
+        manifest["readable"] = readable_block
+    atomic_json(job / "manifest.json", manifest)
+    utterance = Utterance(
+        utterance_id="u1",
+        source_file="a.m4a",
+        source_start=0.0,
+        source_end=1.0,
+        meeting_start=0.0,
+        meeting_end=1.0,
+        speaker_id="SPEAKER_00",
+        speaker_name="SPEAKER_00",
+        raw_text="усвол материал",
+        confidence={},
+        light_text="усвол материал.",
+    )
+    atomic_json(
+        job / "canonical.json",
+        {
+            "schema_version": 2,
+            "timeline": [{"path": "/x/a.m4a"}],
+            "utterances": [utterance.to_dict()],
+            "diarization": {},
+            "speaker_previews": {},
+        },
+    )
+    return job
+
+
+def _stub_readable_pass(monkeypatch, *, fail=False):
+    """Replace the OpenAI call; return the list its invocations are recorded in."""
+    calls = []
+
+    def fake_clean_readable(utterances, model, protected, context_prompt, **kwargs):
+        calls.append(model)
+        if fail:
+            raise RuntimeError("OPENAI_API_KEY is not set")
+        return ReadableResult(
+            texts={item.utterance_id: "Усвоил материал." for item in utterances},
+            concerns=[],
+            usage={"input_tokens": 10, "output_tokens": 3},
+        )
+
+    monkeypatch.setattr("transcribe_meeting.core.clean_readable", fake_clean_readable)
+    return calls
+
+
+@pytest.fixture
+def stub_run_job(monkeypatch):
+    """resume's local stages are checkpointed already; only the readable pass matters."""
+    monkeypatch.setattr("transcribe_meeting.cli.run_job", lambda *args, **kwargs: None)
+
+
+def test_resume_runs_the_readable_pass_when_the_job_was_interrupted_before_it(
+    tmp_path, monkeypatch, stub_run_job
+):
+    job = _readable_job(tmp_path)
+    calls = _stub_readable_pass(monkeypatch)
+
+    result = CliRunner().invoke(app, ["resume", str(job)])
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["gpt-test"]  # the model the job was configured with
+    assert (job / "transcript.readable.md").exists()
+    assert read_json(job / "manifest.json")["readable"]["status"] == "complete"
+
+
+def test_resume_records_the_readable_result_in_result_json(tmp_path, monkeypatch, stub_run_job):
+    """resume writes result.json after the readable pass, not before.
+
+    Ordering is the whole point: run it afterwards and result.json still carries
+    "readable was requested, but transcript.readable.md was not created".
+    """
+    job = _readable_job(tmp_path)
+    _stub_readable_pass(monkeypatch)
+
+    CliRunner().invoke(app, ["resume", str(job)])
+
+    result = read_json(job / "result.json")
+    assert result["transcripts"]["readable"] == "transcript.readable.md"
+    assert result["readable"]["status"] == "complete"
+    assert not [item for item in result["warnings"] if "readable was requested" in item]
+
+
+def test_resume_does_not_repeat_a_readable_pass_that_already_completed(
+    tmp_path, monkeypatch, stub_run_job
+):
+    """Resuming a finished job must not spend the tokens a second time."""
+    job = _readable_job(tmp_path, readable_block={"model": "gpt-test", "status": "complete"})
+    calls = _stub_readable_pass(monkeypatch)
+
+    result = CliRunner().invoke(app, ["resume", str(job)])
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+
+
+def test_resume_retries_a_readable_pass_that_previously_failed(tmp_path, monkeypatch, stub_run_job):
+    """A failed pass is usually a missing key or an unreachable endpoint: retry it."""
+    job = _readable_job(
+        tmp_path, readable_block={"model": "gpt-test", "status": "failed", "error": "no key"}
+    )
+    calls = _stub_readable_pass(monkeypatch)
+
+    CliRunner().invoke(app, ["resume", str(job)])
+
+    assert calls == ["gpt-test"]
+    assert read_json(job / "manifest.json")["readable"]["status"] == "complete"
+
+
+def test_resume_leaves_a_job_that_never_asked_for_readable_alone(
+    tmp_path, monkeypatch, stub_run_job
+):
+    job = _readable_job(tmp_path, modes=("raw", "light"))
+    calls = _stub_readable_pass(monkeypatch)
+
+    result = CliRunner().invoke(app, ["resume", str(job)])
+
+    assert result.exit_code == 0, result.output
+    assert calls == []
+    assert not (job / "transcript.readable.md").exists()
+
+
+def test_resume_survives_a_failing_readable_pass_and_says_how_to_retry(
+    tmp_path, monkeypatch, stub_run_job
+):
+    """The local transcript is finished; an unreachable LLM must not fail the job."""
+    # The retry hint embeds tmp_path, so rich's hard wrap would otherwise land at a
+    # machine-dependent point and could split "--mode readable" across two lines.
+    monkeypatch.setenv("COLUMNS", "400")
+    job = _readable_job(tmp_path)
+    _stub_readable_pass(monkeypatch, fail=True)
+
+    result = CliRunner().invoke(app, ["resume", str(job)])
+
+    assert result.exit_code == 0, result.output
+    assert f"transcribe-meeting clean {job} --mode readable" in result.output
+    assert read_json(job / "manifest.json")["readable"]["status"] == "failed"
+    assert (job / "result.json").exists()

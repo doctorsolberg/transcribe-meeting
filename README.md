@@ -636,6 +636,12 @@ Argument: `job_dir` (folder of an unfinished job, required).
 | `--cpu-threads` | from the manifest | Temporary CPU thread count for this resume; the manifest is not changed. |
 | `--ffmpeg-threads` | from the manifest | Temporary thread count per FFmpeg process; the manifest is not changed. |
 
+If the job was created with `--clean readable`, `resume` also runs the
+`readable` pass once the local stages are done, using the LLM from the
+manifest. A pass that already finished is not repeated; one that failed is
+retried. As in `run`, a failing `readable` doesn't fail the job — `raw` and
+`light` stay as they are and the command prints how to retry with `clean`.
+
 ### `glossary`
 
 - `glossary list` — no options besides the standard ones.
