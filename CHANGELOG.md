@@ -3,6 +3,19 @@
 Format — [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning — [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`resume` skipped the `readable` pass.** The LLM cleanup runs outside
+  `run_job` and has no `.stages/` marker, so a job interrupted before it
+  and then resumed finished the local stages, printed `Done` and exited 0
+  without ever producing `transcript.readable.md` — the only trace was a
+  warning inside `result.json`. `resume` now runs the pass the job's
+  manifest asked for, before writing `result.json`. A pass already
+  recorded as complete is not repeated (resuming a finished job must not
+  spend the tokens twice); a failed one is retried.
+
 ## [1.0.0] — 2026-08-23
 
 First public release. Everything below is relative to internal version

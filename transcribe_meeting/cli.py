@@ -611,6 +611,32 @@ def _free_space_bytes(path: Path) -> int:
     return 0
 
 
+def _finish_readable(job: Path, llm_model: str | None = None) -> None:
+    """Run the readable pass if the job asked for it and does not have it yet.
+
+    `run` and `resume` share this. The LLM pass lives outside run_job and has no
+    `.stages/` marker, so a job interrupted before it used to stay without a
+    readable transcript forever: resume finished the local stages, printed "Done"
+    and left the manifest saying nothing was ever attempted. What the job asked
+    for is in the manifest, which is why the requested modes are read from there
+    rather than passed in — resume has no CLI flags to read them from.
+
+    A pass already recorded as complete is never repeated: resuming a finished job
+    must not spend the tokens a second time. A previously failed one is retried,
+    since the cause is usually a missing key or an unreachable endpoint.
+    """
+    manifest = read_json(job / "manifest.json")
+    if "readable" not in (manifest["config"].get("clean") or []):
+        return
+    if (manifest.get("readable") or {}).get("status") == "complete":
+        return
+    if not try_readable(job, llm_model):
+        print(
+            f"[yellow]readable was not created.[/] Retry separately: "
+            f"`transcribe-meeting clean {job} --mode readable`."
+        )
+
+
 @app.command()
 def doctor(
     asr_models: str = typer.Option(
@@ -998,11 +1024,7 @@ def run(
         preflight_path.unlink(missing_ok=True)
     try:
         run_job(job, resume=resume)
-        if "readable" in modes and not try_readable(job, llm_model):
-            print(
-                f"[yellow]readable was not created.[/] Retry separately: "
-                f"`transcribe-meeting clean {job} --mode readable`."
-            )
+        _finish_readable(job, llm_model)
         replacements = _resolve_speaker_name_overrides(speaker_names, _existing_speaker_names(job))
         if replacements:
             rename_speakers(job, replacements)
@@ -1071,6 +1093,8 @@ def resume(
         cpu_threads_override=cpu_threads,
         ffmpeg_threads_override=ffmpeg_threads,
     )
+    # The readable pass the job was configured for, if the interrupt landed before it.
+    _finish_readable(job_dir)
     # A job interrupted mid-run (Ctrl-C in `run`) never reached run's own
     # write_job_result call; resume is what finishes it, so it must write result.json
     # itself too — otherwise a resumed-to-completion job would have none at all.
