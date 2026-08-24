@@ -373,11 +373,17 @@ def test_a_usage_error_after_the_run_stays_a_usage_error(tmp_path, monkeypatch):
 
     job_holder: dict[str, Path] = {}
 
-    def fake_create_job(_parts, _name, _config, _probes):
+    def fake_create_job(_parts, name, config, _probes):
         job = tmp_path / "job"
         (job / ".stages").mkdir(parents=True)
         job_holder["job"] = job
         (tmp_path / "home" / "output").mkdir(parents=True, exist_ok=True)
+        # The real create_job writes the manifest before run returns the job, and
+        # everything run does afterwards (run_job, the readable pass) reads it back.
+        (job / "manifest.json").write_text(
+            json.dumps({"job_id": job.name, "meeting_name": name, "config": config}),
+            encoding="utf-8",
+        )
         return job
 
     monkeypatch.setattr(
