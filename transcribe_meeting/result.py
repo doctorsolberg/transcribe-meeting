@@ -38,9 +38,13 @@ def _short_error(text: str, limit: int = 160) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
 
 
-def build_job_result(job: Path) -> dict[str, Any]:
-    manifest = read_json(job / "manifest.json")
-    canonical = read_json(job / "canonical.json") if (job / "canonical.json").exists() else {}
+def build_job_result(
+    job: Path, *, manifest: dict[str, Any] | None = None, staged: Path | None = None
+) -> dict[str, Any]:
+    manifest = read_json(job / "manifest.json") if manifest is None else manifest
+    exports = job if staged is None else staged
+    canonical_path = exports / "canonical.json"
+    canonical = read_json(canonical_path) if canonical_path.is_file() else {}
     utterances: list[dict[str, Any]] = canonical.get("utterances", [])
     diarization_data: dict[str, Any] = canonical.get("diarization") or {}
     previews: dict[str, dict[str, Any]] = canonical.get("speaker_previews") or {}
@@ -131,11 +135,11 @@ def build_job_result(job: Path) -> dict[str, Any]:
         light_file = job / f"transcript.light.{model_name}.md"
         if light_file.exists():
             light_files[model_name] = light_file.name
-    readable_path = job / "transcript.readable.md"
-    readable_file = readable_path.name if readable_path.exists() else None
+    readable_path = exports / "transcript.readable.md"
+    readable_file = readable_path.name if readable_path.is_file() else None
 
-    readable_manifest = manifest.get("readable") or {"status": "not requested"}
-    review_csv = job / "review" / "readable_changes.csv"
+    readable_manifest: dict[str, Any] = manifest.get("readable") or {"status": "not requested"}
+    review_csv = exports / "review" / "readable_changes.csv"
     readable_out = {
         "status": readable_manifest.get("status"),
         "model": readable_manifest.get("model"),
@@ -143,12 +147,37 @@ def build_job_result(job: Path) -> dict[str, Any]:
         "needs_attention": readable_manifest.get("needs_attention"),
         "report": "review/readable_changes.csv" if review_csv.exists() else None,
     }
+    for field in (
+        "accepted_utterances",
+        "fallback_utterances",
+        "provider",
+        "api",
+        "response_format",
+        "repaired_utterances",
+        "endpoint_failure",
+        "pending_utterance_ids",
+    ):
+        if readable_manifest.get(field) is not None:
+            readable_out[field] = readable_manifest[field]
     if readable_out["status"] == "failed":
         # summary.md is pasted into chat as-is, so a raw SDK error dict would land in
         # front of a human. The full text stays in manifest.readable.error.
         warnings.append(f"readable skipped: {_short_error(readable_manifest.get('error', ''))}")
+    elif readable_out["status"] == "no speech":
+        warnings.append("No speech detected; readable was not run.")
+    elif readable_out.get("fallback_utterances"):
+        warnings.append(
+            f"readable used the local text for {readable_out['fallback_utterances']} utterance(s)."
+        )
     elif "readable" in (config.get("clean") or []) and readable_file is None:
         warnings.append("readable was requested, but transcript.readable.md was not created.")
+    if readable_out["status"] == "partial":
+        warnings.append("Readable did not finish every batch. The export includes local text.")
+    last_attempt = readable_manifest.get("last_attempt")
+    if isinstance(last_attempt, dict):
+        readable_out["last_attempt"] = last_attempt
+        if last_attempt.get("status") == "failed":
+            warnings.append("The latest readable attempt failed; the previous version was kept.")
 
     return {
         "job_id": manifest.get("job_id", job.name),

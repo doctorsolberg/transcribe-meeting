@@ -4,7 +4,7 @@ import wave
 import pytest
 
 from transcribe_meeting import asr
-from transcribe_meeting.util import atomic_json, read_json
+from transcribe_meeting.util import sha256
 
 
 def _wav(path, *, seconds: int = 1, rate: int = 16_000) -> None:
@@ -95,7 +95,8 @@ def test_transcribe_deepgram_writes_checkpoint_and_returns_data(tmp_path, monkey
 
     assert result == {"results": {"channels": [{"alternatives": [{"words": []}]}]}}
     assert target.exists()
-    assert read_json(target) == result
+    fingerprint = asr.deepgram_response_fingerprint(sha256(audio), "ru")
+    assert asr.read_deepgram_response(target, fingerprint) == result
     assert seen == {"api_key": "key-1", "language": "ru"}
 
 
@@ -105,7 +106,9 @@ def test_transcribe_deepgram_second_call_reads_checkpoint_without_a_request(tmp_
     audio = tmp_path / "meeting.wav"
     _wav(audio)
     target = tmp_path / "asr" / "deepgram-nova-3" / "meeting.json"
-    atomic_json(target, {"results": "already-here"})
+    response = {"results": {"channels": [{"alternatives": [{"words": []}]}]}}
+    monkeypatch.setattr(asr, "_deepgram_request", lambda *_: response)
+    assert asr.transcribe_deepgram(audio, "key-1", "ru", target) == response
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("transcribe_deepgram must not re-request when checkpoint exists")
@@ -114,7 +117,7 @@ def test_transcribe_deepgram_second_call_reads_checkpoint_without_a_request(tmp_
 
     result = asr.transcribe_deepgram(audio, "key-1", "ru", target)
 
-    assert result == {"results": "already-here"}
+    assert result == response
 
 
 def test_transcribe_deepgram_rejects_oversized_track_before_any_request(tmp_path, monkeypatch):

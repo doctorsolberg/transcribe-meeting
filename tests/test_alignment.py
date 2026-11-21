@@ -3,6 +3,7 @@ from transcribe_meeting.alignment import (
     assign_words,
     make_utterances,
     mark_overlap,
+    overlap_seconds,
 )
 from transcribe_meeting.model import Word
 
@@ -28,6 +29,35 @@ def test_utterances_break_on_speaker_and_stable_ids():
     )
     assert [item.utterance_id for item in items] == ["p001-u00001", "p001-u00002"]
     assert [item.speaker_name for item in items] == ["А", "Б"]
+
+
+def test_out_of_order_words_keep_text_sequence_and_enclose_all_spans():
+    words = [Word(1.5, 2.2, "First"), Word(0.1, 0.6, " second")]
+    (utterance,) = make_utterances(
+        words, source_file="source", source_offset=10, speaker_names={}, prefix="p001"
+    )
+    assert utterance.raw_text == "First second"
+    assert (utterance.source_start, utterance.source_end) == (0.1, 2.2)
+    assert (utterance.meeting_start, utterance.meeting_end) == (10.1, 12.2)
+
+
+def test_assign_words_only_scores_candidate_overlaps(monkeypatch):
+    from transcribe_meeting import alignment
+
+    compared = 0
+
+    def score(*args):
+        nonlocal compared
+        compared += 1
+        return overlap_seconds(*args)
+
+    monkeypatch.setattr(alignment, "overlap_seconds", score)
+    turns = [(float(i), i + 0.8, str(i)) for i in range(300)]
+    words = [Word(i + 0.2, i + 0.4, "word") for i in reversed(range(300))]
+    assert [word.speaker_id for word in assign_words(words, turns)] == [
+        turn[2] for turn in turns[::-1]
+    ]
+    assert compared < 900
 
 
 def test_variants_dict_fills_in_for_every_non_canonical_model():

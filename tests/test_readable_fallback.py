@@ -50,6 +50,33 @@ def test_failed_readable_leaves_no_readable_file(tmp_path):
     assert not (job / "transcript.readable.md").exists()
 
 
+def test_silent_job_neither_renders_nor_requests_readable(tmp_path, monkeypatch):
+    job = _rendered_job(tmp_path, [])
+
+    def no_request(*args, **kwargs):
+        raise AssertionError("silent job must not call a provider")
+
+    monkeypatch.setattr("transcribe_meeting.core.clean_readable", no_request)
+
+    assert not (job / "transcript.readable.md").exists()
+    assert try_readable(job) is True
+    assert read_json(job / "manifest.json")["readable"]["status"] == "no speech"
+
+
+def test_readable_only_still_renders_local_outputs(tmp_path):
+    job = _rendered_job(tmp_path, [_utterance(1)])
+    manifest = read_json(job / "manifest.json")
+    manifest["config"]["clean"] = ["readable"]
+    atomic_json(job / "manifest.json", manifest)
+    (job / "transcript.light.v3_rnnt.md").unlink()
+    (job / "transcript.raw.v3_rnnt.md").unlink()
+
+    render_all(job)
+
+    assert (job / "transcript.light.v3_rnnt.md").is_file()
+    assert (job / "transcript.raw.v3_rnnt.md").is_file()
+
+
 def test_successful_readable_produces_its_own_file(tmp_path):
     job = _rendered_job(tmp_path, [_utterance(1, "Текст.")])
 
@@ -107,3 +134,37 @@ def test_try_readable_reports_success(tmp_path, monkeypatch):
 
     assert try_readable(job) is True
     assert "readable" not in read_json(job / "manifest.json")
+
+
+def test_failed_retry_preserves_previously_accepted_readable(tmp_path, monkeypatch):
+    job = _rendered_job(tmp_path, [_utterance(1, "Текст.")])
+    path = job / "transcript.readable.md"
+    original_text = path.read_bytes()
+    manifest = read_json(job / "manifest.json")
+    manifest["readable"] = {"status": "complete", "model": "accepted-model"}
+    atomic_json(job / "manifest.json", manifest)
+
+    def bad_response(*args, **kwargs):
+        raise RuntimeError("endpoint unavailable")
+
+    monkeypatch.setattr("transcribe_meeting.core.clean_readable", bad_response)
+    assert try_readable(job, "retry-model") is False
+    state = read_json(job / "manifest.json")["readable"]
+    assert state["status"] == "complete"
+    assert state["model"] == "accepted-model"
+    assert state["last_attempt"]["status"] == "failed"
+    assert state["last_attempt"]["model"] == "retry-model"
+    assert path.read_bytes() == original_text
+
+
+def test_failed_retry_does_not_replace_local_files(tmp_path, monkeypatch):
+    job = _rendered_job(tmp_path, [_utterance(1)])
+    path = job / "transcript.light.v3_rnnt.md"
+    original_text = path.read_bytes()
+
+    def bad_response(*args, **kwargs):
+        raise RuntimeError("endpoint unavailable")
+
+    monkeypatch.setattr("transcribe_meeting.core.clean_readable", bad_response)
+    assert try_readable(job) is False
+    assert path.read_bytes() == original_text

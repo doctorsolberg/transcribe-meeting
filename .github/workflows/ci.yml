@@ -1,13 +1,7 @@
 name: CI
 
-# This is also the project's first-ever run on Linux — everything
-# before this workflow existed was verified on Apple Silicon only, and the
-# Linux-compatibility claim in README rested solely on uv.lock's wheel list.
-#
-# Deliberately excluded: downloading any model (GigaAM, VAD, pyannote, WeSpeaker)
-# and any call to a network ASR/diarization/LLM provider (Groq, Deepgram, OpenAI).
-# The full pytest suite runs entirely on fixtures and stubs (see tests/, especially
-# tests/test_end_to_end_pipeline.py) and needs neither, by design.
+# No provider calls or model downloads: tests use fixtures, bundled Silero VAD,
+# and generated audio. FFmpeg and ONNX Runtime are exercised with local inputs.
 on:
   push:
     branches: [main]
@@ -26,52 +20,59 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install ffmpeg
-        # Hard requirement per README (check_ffmpeg gates `setup` and `run`'s audio
-        # diagnostics). Also needed by two real (requires_ffmpeg-marked) tests in
-        # tests/test_audio_preprocess.py that shell out to the actual binary; every
-        # other ffmpeg/ffprobe call in the suite is monkeypatched. Without this step
-        # those two tests would be skipped and the `doctor` smoke step below would
-        # report ffmpeg:false.
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
             sudo apt-get update && sudo apt-get install -y ffmpeg
           else
             brew install ffmpeg
           fi
+          command -v ffmpeg
+          command -v ffprobe
 
       - name: Install uv
-        # Pinned to an exact version on purpose: setup-uv publishes floating major
-        # tags only up to v7, so @v10 does not resolve even though v10.0.1 is the
-        # current release. Bump this by hand after checking the tag exists.
         uses: astral-sh/setup-uv@v10.0.1
 
       - name: Sync dependencies
-        # --frozen: fail instead of silently re-resolving if uv.lock ever drifts
-        # from pyproject.toml, so a stale lock is a CI failure, not a surprise.
-        run: uv sync --frozen --python ${{ matrix.python }} --group dev
+        run: uv sync --locked --python ${{ matrix.python }} --group dev
 
       - name: Ruff
-        run: uv run ruff check .
+        run: uv run --no-sync ruff check .
 
       - name: Ruff format
-        run: uv run ruff format --check .
-
-      - name: Pytest
-        run: uv run pytest -q
+        run: uv run --no-sync ruff format --check .
 
       # 75% is today's measured coverage floor (see CONTRIBUTING.md); a regression
       # below it fails CI instead of only showing up as a smaller number in the log.
       - name: Coverage report
-        run: uv run pytest -q --cov=transcribe_meeting --cov-report=term-missing --cov-fail-under=75
+        run: uv run --no-sync pytest -q --cov=transcribe_meeting --cov-report=term-missing --cov-fail-under=75
 
       - name: Build package
-        # Proves the sdist/wheel actually build before a release, on both OSes.
-        run: uv build
+        run: uv build --python ${{ matrix.python }}
+
+      - name: Verify unpacked sdist and run offline integration tests
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        run: |
+          unpacked="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/tm-sdist.XXXXXX")"
+          tar -xzf dist/*.tar.gz -C "$unpacked"
+          cd "$unpacked"/transcribe_meeting-*
+          for file in .env.example CHANGELOG.md CONTRIBUTING.md uv.lock docs/benchmarks.md \
+              scripts/compare_routes.py scripts/model_agreement.py tests/conftest.py \
+              tests/fixtures/deepgram_response.json tests/fixtures/gigaam_words.json \
+              tests/fixtures/groq_words.json; do
+            test -f "$file"
+          done
+          test -z "$(find . \( -name '.hermes' -o -name '.env' -o -name '.env.*' \) ! -name '.env.example' -print)"
+          uv sync --locked --offline --python ${{ matrix.python }} --group dev
+          uv run --no-sync transcribe-meeting --help
+          uv run --no-sync pytest -q tests/test_provider_fixtures.py tests/test_end_to_end_pipeline.py \
+            tests/test_setup_offline.py \
+            tests/test_provisioning.py::test_network_asr_setup_smokes_real_foxnose_runtime_offline
+          uv run --no-sync pytest -q -m requires_ffmpeg tests/test_audio_preprocess.py
 
       - name: doctor smoke check (no models on a fresh CI checkout)
-        # Never a CI gate: doctor's default route needs a downloaded GigaAM
-        # checkpoint and a downloaded WeSpeaker model (route_ready
-        # is genuinely false without them, by design), and CI never runs `setup`.
-        # This step only proves the command imports its dependencies and runs to
-        # completion without an unhandled exception, on Linux and on macOS alike.
-        run: uv run transcribe-meeting doctor || true
+        run: |
+          empty="$(mktemp -d)"
+          status=0
+          uv run --no-sync transcribe-meeting --data-root "$empty" doctor > "$empty/doctor.json" || status=$?
+          test "$status" -eq 1
+          uv run --no-sync python -c 'import json, sys; assert json.load(sys.stdin)["route_ready"] is False' < "$empty/doctor.json"

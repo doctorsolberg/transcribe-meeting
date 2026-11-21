@@ -12,8 +12,7 @@ from transcribe_meeting.audio import (
     pre_emphasize_pcm,
 )
 
-# decode_pcm shells out to a real ffmpeg binary (no monkeypatching), so these two
-# tests need it on PATH; the rest of the suite stubs ffmpeg entirely.
+# decode_pcm shells out to a real ffmpeg binary (no monkeypatching).
 requires_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs a real ffmpeg")
 
 
@@ -54,6 +53,7 @@ def test_pre_emphasis_reports_clipping_instead_of_normalizing(tmp_path):
     assert read_pcm(target) == [32767, -32768]
 
 
+@pytest.mark.requires_ffmpeg
 @requires_ffmpeg
 def test_hpf_and_pre_emphasis_decode_to_working_pcm_without_changing_source(tmp_path):
     source = tmp_path / "source.wav"
@@ -71,6 +71,7 @@ def test_hpf_and_pre_emphasis_decode_to_working_pcm_without_changing_source(tmp_
     assert not target.with_suffix(".preemphasis.wav").exists()
 
 
+@pytest.mark.requires_ffmpeg
 @requires_ffmpeg
 def test_compression_4_to_1_is_applied_to_a_temporary_pcm_copy(tmp_path):
     source = tmp_path / "source.wav"

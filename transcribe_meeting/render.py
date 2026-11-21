@@ -74,6 +74,7 @@ def blocks(utterances: list[Utterance], mode: str) -> list[list[Utterance]]:
         if (
             previous is not None
             and previous.speaker_id == utterance.speaker_id
+            and previous.speaker_name == utterance.speaker_name
             and previous.source_file == utterance.source_file
         ):
             groups[-1].append(utterance)

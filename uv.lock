@@ -2488,12 +2488,13 @@ wheels = [
 
 [[package]]
 name = "transcribe-meeting"
-version = "0.1.0"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "diarize" },
     { name = "gigaam" },
     { name = "huggingface-hub" },
+    { name = "numpy" },
     { name = "openai" },
     { name = "pyannote-audio" },
     { name = "pydantic" },
@@ -2516,6 +2517,7 @@ requires-dist = [
     { name = "diarize", specifier = ">=0.1.2,<0.2" },
     { name = "gigaam", git = "https://github.com/salute-developers/GigaAM.git?rev=7447938d791c4f3e643386ee22c33777004293a5" },
     { name = "huggingface-hub", specifier = ">=0.24,<1" },
+    { name = "numpy", specifier = ">=1.26" },
     { name = "openai", specifier = ">=1.0,<2" },
     { name = "pyannote-audio", specifier = ">=3.3" },
     { name = "pydantic", specifier = ">=2.7,<3" },

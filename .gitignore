@@ -13,3 +13,4 @@ models.lock.json
 .ruff_cache/
 .coverage
 .DS_Store
+/.hermes/

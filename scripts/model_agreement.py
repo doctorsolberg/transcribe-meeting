@@ -1,20 +1,8 @@
-"""Agreement between the canonical ASR model and each variant model within one job.
+"""Compare canonical and variant ASR text offline; see docs/benchmarks.md."""
 
-The project has no reference transcript, and no connected backend returns word
-probabilities, so the only available quality metric is agreement between two
-independent models. This is exactly the metric behind the numbers in the README's
-"Measured facts" section; this script lives here so those numbers can be rechecked,
-not just read.
-
-    uv run python scripts/model_agreement.py output/<job-id> [output/<other-job>]
-
-Be careful interpreting this: the metric is blind to defects shared by both models.
-If both are chunked at the same boundaries, their errors at those boundaries will
-match, and agreement will not reveal it.
-"""
-
+import argparse
 import json
-import sys
+from collections import defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -28,26 +16,42 @@ def norm(text):
 
 
 def report(job):
-    data = json.loads(Path(f"{job}/canonical.json").read_text(encoding="utf-8"))
+    data = json.loads((job / "canonical.json").read_text(encoding="utf-8"))
     us = data["utterances"]
-    models = sorted({m for u in us for m in (u.get("variants") or {})})
-    out = {}
-    for m in models:
-        same = total = 0
-        for u in us:
-            a, b = norm(u["raw_text"]), norm((u.get("variants") or {}).get(m, ""))
+    tally = defaultdict(lambda: [0, 0, 0])
+    words = 0
+    for u in us:
+        a = norm(u["raw_text"])
+        words += len(a)
+        for m, text in (u.get("variants") or {}).items():
+            stats = tally[m]
+            b = norm(text or "")
             if not b:
                 continue
-            match = sum(bl.size for bl in SequenceMatcher(None, a, b).get_matching_blocks())
-            same += match
-            total += max(len(a), len(b))
-        out[m] = (100.0 * same / total if total else 0.0, total)
-    words = sum(len(norm(u["raw_text"])) for u in us)
-    return {"utterances": len(us), "canonical_words": words, "agreement": out}
+            stats[0] += sum(bl.size for bl in SequenceMatcher(None, a, b).get_matching_blocks())
+            stats[1] += max(len(a), len(b))
+            stats[2] += 1
+    return {"utterances": len(us), "canonical_words": words, "agreement": tally}
 
 
-for job in sys.argv[1:]:
-    r = report(job)
-    print(f"{job.split('/')[-1]}: utterances={r['utterances']} words={r['canonical_words']}")
-    for m, (pct, tot) in r["agreement"].items():
-        print(f"    vs {m}: {pct:.2f}% (over {tot} positions)")
+def main():
+    parser = argparse.ArgumentParser(description="Compare canonical and variant ASR text.")
+    parser.add_argument("job", nargs="+", type=Path)
+    for job in parser.parse_args().job:
+        try:
+            r = report(job)
+        except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
+            parser.error(f"{job}: {exc}")
+        utterances = r["utterances"]
+        print(f"{job.name or job}: utterances={utterances} words={r['canonical_words']}")
+        if not r["agreement"]:
+            print("    No ASR variants found")
+        for m, (same, total, covered) in sorted(r["agreement"].items()):
+            pct = f"{100 * same / total:.2f}%" if total else "N/A"
+            print(
+                f"    vs {m}: {pct} ({total} positions; {covered}/{utterances} utterances covered)"
+            )
+
+
+if __name__ == "__main__":
+    main()

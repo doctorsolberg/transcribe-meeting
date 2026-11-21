@@ -3,6 +3,16 @@ import pytest
 from transcribe_meeting import diarization
 
 
+def test_deepgram_same_speaker_turn_encloses_nested_word_spans():
+    rows = diarization._deepgram_segments_from_words(
+        [
+            {"start": 1.1, "end": 2.4, "speaker": 0},
+            {"start": 0.9, "end": 1.2, "speaker": 0},
+        ]
+    )
+    assert rows == [{"start": 0.9, "end": 2.4, "speaker": "SPEAKER_00"}]
+
+
 def test_deepgram_segments_glue_same_speaker_words_within_the_gap():
     words = [
         {"word": "a", "start": 0.0, "end": 0.4, "speaker": 0},

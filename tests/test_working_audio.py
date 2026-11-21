@@ -1,5 +1,5 @@
 from transcribe_meeting import core
-from transcribe_meeting.util import atomic_json, read_json
+from transcribe_meeting.util import atomic_json, read_json, sha256
 
 
 def test_working_audio_matches_relative_diagnostics_to_absolute_manifest_path(
@@ -13,7 +13,7 @@ def test_working_audio_matches_relative_diagnostics_to_absolute_manifest_path(
         {"parts": [{"path": "src/part.wav", "stream_index": 0}]},
     )
     manifest = {
-        "sources": [{"path": str(source.resolve())}],
+        "sources": [{"path": str(source.resolve()), "sha256": sha256(source)}],
         "config": {"asr_preprocess": "none", "asr_compression": "none"},
     }
     monkeypatch.setenv("TRANSCRIBE_HOME", str(tmp_path))

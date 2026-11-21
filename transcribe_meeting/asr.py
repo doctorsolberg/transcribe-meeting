@@ -14,9 +14,14 @@ import wave
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from .util import atomic_json, read_json
+from .audio import load_model_waveform
+from .audio import wav_duration as _wav_duration
+from .util import atomic_json, read_json, sha256
+
+if TYPE_CHECKING:
+    from openai import APIStatusError
 
 GIGAAM_COMMIT = "7447938d791c4f3e643386ee22c33777004293a5"
 GROQ_MODEL = "whisper-large-v3"
@@ -325,11 +330,6 @@ class GigaAMBackend:
                 pass
 
 
-def _wav_duration(audio: Path) -> float:
-    with wave.open(str(audio), "rb") as handle:
-        return handle.getnframes() / handle.getframerate()
-
-
 def _write_wav_slice(source: Path, target: Path, start: float, end: float) -> None:
     """Copy exact PCM frames without modifying the source working WAV."""
     with wave.open(str(source), "rb") as reader:
@@ -407,7 +407,7 @@ def detect_speech_regions(audio: Path, model_path: Path) -> list[tuple[float, fl
     pipeline = VoiceActivityDetection(segmentation=model)
     pipeline.instantiate({"min_duration_on": 0.0, "min_duration_off": 0.0})
     pipeline.to(torch.device("cpu"))
-    annotation = pipeline(str(audio))
+    annotation = pipeline(load_model_waveform(audio))
     return [(float(turn.start), float(turn.end)) for turn in annotation.get_timeline().support()]
 
 
@@ -419,6 +419,7 @@ def local_vad_parameters() -> dict[str, float]:
         "min_duration_off": 0.0,
         "target": LOCAL_VAD_TARGET_SECONDS,
         "absolute": LOCAL_VAD_ABSOLUTE_SECONDS,
+        "minimum": LOCAL_VAD_MIN_SECONDS,
         "context": LOCAL_VAD_CONTEXT_SECONDS,
     }
 
@@ -450,6 +451,32 @@ def _local_chunk_fingerprint(
     }
 
 
+def _write_checkpoint(
+    path: Path, data: dict[str, Any], fingerprint: dict[str, Any], field: str
+) -> None:
+    checkpoint = {**data, field: fingerprint}
+    atomic_json(path, {**checkpoint, "checkpoint_sha256": _json_digest(checkpoint)})
+
+
+def _read_checkpoint(path: Path, fingerprint: dict[str, Any], field: str) -> dict[str, Any] | None:
+    try:
+        data = read_json(path)
+        if not isinstance(data, dict) or data.get(field) != fingerprint:
+            return None
+        checksum = data.pop("checkpoint_sha256", None)
+        if checksum != _json_digest(data):
+            return None
+    except (OSError, ValueError):
+        return None
+    return data
+
+
+def _validate_chunk(data: dict[str, Any], duration: float, *, allow_overlap: bool = False) -> None:
+    if not isinstance(data.get("words"), list):
+        raise ValueError("ASR response does not contain a words list.")
+    validate_word_timestamps(data["words"], duration, allow_overlap=allow_overlap)
+
+
 def _local_part(
     audio: Path,
     output: Path,
@@ -458,6 +485,7 @@ def _local_part(
     vad_model_path: Path,
     fingerprint: dict[str, Any],
     model_name: str,
+    resume: bool = True,
 ) -> dict[str, Any]:
     duration = _wav_duration(audio)
     # One plan per source file, not per ASR model: which GigaAM checkpoint will read
@@ -466,25 +494,29 @@ def _local_part(
     # over the whole part to arrive at a byte-identical plan.
     vad_path = output.parent.parent / "vad" / f"{output.stem}.json"
     vad_fingerprint = vad_plan_fingerprint(fingerprint)
-    if vad_path.exists() and read_json(vad_path).get("fingerprint") == vad_fingerprint:
-        plan = read_json(vad_path).get("chunks", [])
+    saved_plan = _read_checkpoint(vad_path, vad_fingerprint, "fingerprint") if resume else None
+    if saved_plan is not None:
+        plan = saved_plan["chunks"]
     else:
         regions = detect_speech_regions(audio, vad_model_path)
         plan = [
             {"index": index, "start": start, "end": end}
             for index, (start, end) in enumerate(split_vad_regions(regions, duration), 1)
         ]
-        atomic_json(
+        _write_checkpoint(
             vad_path,
             {
-                "fingerprint": vad_fingerprint,
                 "regions": regions,
                 "chunks": plan,
                 "duration": duration,
             },
+            vad_fingerprint,
+            "fingerprint",
         )
     combined: dict[str, Any] = {"text": "", "segments": [], "words": [], "chunks": []}
     chunk_root = output.parent / "chunks" / output.stem
+    previous_end = None
+    previous_padding: list[dict[str, Any]] = []
     for item in plan:
         index, start, end = int(item["index"]), float(item["start"]), float(item["end"])
         # Decode a bit of the neighbouring chunk on each side so a word sitting on the
@@ -495,23 +527,30 @@ def _local_part(
         wav_path = chunk_root / f"{index:03d}.wav"
         json_path = chunk_root / f"{index:03d}.json"
         chunk_fp = _local_chunk_fingerprint(fingerprint, start, end)
-        checkpoint = read_json(json_path) if json_path.exists() else None
-        if not checkpoint or checkpoint.get("checkpoint_fingerprint") != chunk_fp:
+        checkpoint = (
+            _read_checkpoint(json_path, chunk_fp, "checkpoint_fingerprint") if resume else None
+        )
+        if checkpoint is None:
             _write_wav_slice(audio, wav_path, slice_start, slice_end)
-            value = backend.transcribe(wav_path)
-            validate_word_timestamps(value.get("words", []), slice_end - slice_start)
-            checkpoint = {**value, "checkpoint_fingerprint": chunk_fp}
-            atomic_json(json_path, checkpoint)
+            checkpoint = backend.transcribe(wav_path)
+            _validate_chunk(checkpoint, slice_end - slice_start)
+            _write_checkpoint(json_path, checkpoint, chunk_fp, "checkpoint_fingerprint")
         # Keep only the words whose centre falls in this chunk's nominal window: the
         # padding on each side was also decoded by the neighbouring chunk, so without
         # this a seam word would be duplicated, and clipping to the window is what
         # keeps every kept word inside [start, end) for the final duration check below.
         lower, upper = start - slice_start, end - slice_start
-        kept = []
-        for word in checkpoint.get("words", []):
+        kept, leading_padding, trailing_padding = [], [], []
+        for word in checkpoint["words"]:
             center = (float(word["start"]) + float(word["end"])) / 2
             if not (lower <= center < upper):
-                continue  # the word belongs to the neighbouring chunk, which also decoded it
+                candidate = {
+                    **word,
+                    "start": float(word["start"]) + slice_start,
+                    "end": float(word["end"]) + slice_start,
+                }
+                (leading_padding if center < lower else trailing_padding).append(candidate)
+                continue
             kept.append(
                 {
                     **word,
@@ -523,6 +562,26 @@ def _local_part(
             {"text": " ".join(word["word"] for word in kept), "segments": [], "words": kept},
             slice_start,
         )
+        if previous_end == start and previous_padding and leading_padding:
+            left, right = previous_padding[0], leading_padding[-1]
+            if left["word"].strip().casefold() == right["word"].strip().casefold():
+                # Both models heard the same word but each placed its center in
+                # the other chunk. Recover the interval they agree on, unless
+                # it would overlap a word already kept from either window.
+                low = max(
+                    left["start"],
+                    right["start"],
+                    combined["words"][-1]["end"] if combined["words"] else 0.0,
+                )
+                high = min(
+                    left["end"],
+                    right["end"],
+                    value["words"][0]["start"] if value["words"] else duration,
+                )
+                if high > low:
+                    value["words"].insert(0, {**left, "start": low, "end": high})
+                    value["text"] = " ".join(word["word"] for word in value["words"])
+        previous_end, previous_padding = end, trailing_padding
         combined["text"] += (" " if combined["text"] and value["text"] else "") + value["text"]
         combined["segments"].extend(value["segments"])
         combined["words"].extend(value["words"])
@@ -598,8 +657,38 @@ def _groq_prompt(prompt: str) -> str | None:
     return f"{prompt[:half]} … {prompt[-half:]}"
 
 
+def groq_request_fingerprint(language: str, prompt: str, chunk_minutes: int) -> dict[str, Any]:
+    return {
+        "model": GROQ_MODEL,
+        "language": None if language == "auto" else language,
+        "prompt_sha256": hashlib.sha256((_groq_prompt(prompt) or "").encode()).hexdigest(),
+        "chunk_minutes": min(chunk_minutes or 10, GROQ_FREE_MAX_CHUNK_SECONDS // 60),
+        "groq_request_version": 2,
+    }
+
+
 def _transcribe_groq(
-    audio: Path, output: Path, language: str, prompt: str, *, limiter: GroqFreeTierLimiter | None
+    audio: Path,
+    output: Path,
+    language: str,
+    prompt: str,
+    *,
+    limiter: GroqFreeTierLimiter | None,
+    checkpoint_fingerprint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = _request_groq(audio, language, prompt, limiter)
+    _normalize_groq_response(result, _wav_duration(audio))
+    if checkpoint_fingerprint is None:
+        atomic_json(output, result)
+    else:
+        # Persist the validated provider response and its provenance together. A
+        # stopped part assembly must never require a second upload of this chunk.
+        _write_checkpoint(output, result, checkpoint_fingerprint, "checkpoint_fingerprint")
+    return result
+
+
+def _request_groq(
+    audio: Path, language: str, prompt: str, limiter: GroqFreeTierLimiter | None
 ) -> dict[str, Any]:
     token = os.environ.get("GROQ_API_KEY")
     if not token:
@@ -609,10 +698,34 @@ def _transcribe_groq(
     if limiter:
         limiter.before_upload(_wav_duration(audio))
     try:
-        from openai import APIStatusError, OpenAI
+        from openai import APIStatusError, DefaultHttpxClient, OpenAI
     except ImportError as exc:
         raise RuntimeError("The openai package is missing; run uv sync.") from exc
-    client = OpenAI(api_key=token, base_url="https://api.groq.com/openai/v1")
+
+    def strip_openai_headers(request: Any) -> None:
+        request.headers.pop("OpenAI-Organization", None)
+        request.headers.pop("OpenAI-Project", None)
+
+    with DefaultHttpxClient(
+        follow_redirects=False, trust_env=False, event_hooks={"request": [strip_openai_headers]}
+    ) as http_client:
+        client = OpenAI(
+            api_key=token,
+            base_url="https://api.groq.com/openai/v1",
+            http_client=http_client,
+            max_retries=0,
+        )
+        return _upload_groq(client, audio, language, prompt, limiter, APIStatusError)
+
+
+def _upload_groq(
+    client: Any,
+    audio: Path,
+    language: str,
+    prompt: str,
+    limiter: GroqFreeTierLimiter | None,
+    status_error: type[APIStatusError],
+) -> dict[str, Any]:
     status = limiter.status if limiter else None
     # The limiter models the documented free-tier ceilings, but an account can be
     # throttled for reasons it cannot see (a stricter tier, a shared key, a burst
@@ -632,11 +745,9 @@ def _transcribe_groq(
                     temperature=0,
                 )
             break
-        except APIStatusError as exc:
+        except status_error as exc:
             if exc.status_code != 429 or attempt == GROQ_RATE_LIMIT_RETRIES:
-                raise RuntimeError(
-                    f"Groq ASR returned HTTP {exc.status_code}: {exc.message}"
-                ) from exc
+                raise RuntimeError(f"Groq ASR returned HTTP {exc.status_code}.") from None
             wait = _retry_after_seconds(exc) or GROQ_RATE_LIMIT_BACKOFF_SECONDS[attempt]
             if status:
                 status(
@@ -652,8 +763,38 @@ def _transcribe_groq(
         "language": language,
         "output_schema_version": ASR_OUTPUT_SCHEMA_VERSION,
     }
-    atomic_json(output, result)
     return result
+
+
+def _normalize_groq_response(data: dict[str, Any], duration: float) -> None:
+    if "segments" not in data or data["segments"] is None:
+        data["segments"] = []
+    if not isinstance(data["segments"], list):
+        raise ValueError("Groq response does not contain a segments list.")
+    if data.get("words") is None:
+        data["words"] = []
+    for segment in data["segments"]:
+        try:
+            start, end = _finite_time(segment["start"]), _finite_time(segment["end"])
+            if start < -0.05 or end > duration + 0.05 or start > end:
+                raise ValueError("Invalid interval.")
+            if segment.get("words") is None:
+                segment.pop("words", None)
+            else:
+                _validate_chunk(segment, duration, allow_overlap=True)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Groq response contains an invalid segment.") from exc
+    _validate_chunk(data, duration, allow_overlap=True)
+    if not data["words"]:
+        data["words"] = [
+            dict(word) for segment in data["segments"] for word in segment.get("words", [])
+        ]
+        _validate_chunk(data, duration, allow_overlap=True)
+    if not data["words"] and (
+        str(data.get("text") or "").strip()
+        or any(str(segment.get("text") or "").strip() for segment in data["segments"])
+    ):
+        raise ValueError("Groq returned spoken text without word timestamps.")
 
 
 def _shift_timestamps(data: dict[str, Any], offset: float) -> dict[str, Any]:
@@ -680,10 +821,8 @@ def _deepgram_language_param(language: str) -> str:
     return "multi" if language == "auto" else language
 
 
-def _deepgram_request(audio_bytes: bytes, api_key: str, language: str) -> dict[str, Any]:
-    """The network boundary, isolated so tests can monkeypatch it without touching
-    urllib or performing a real HTTP request."""
-    params = {
+def deepgram_request_parameters(language: str) -> dict[str, str]:
+    return {
         "model": DEEPGRAM_API_MODEL,
         "language": _deepgram_language_param(language),
         # Diarization is enabled BY specifying diarize_model; passing "diarize" as well is a
@@ -693,6 +832,12 @@ def _deepgram_request(audio_bytes: bytes, api_key: str, language: str) -> dict[s
         "smart_format": "true",
         "punctuate": "true",
     }
+
+
+def _deepgram_request(audio_bytes: bytes, api_key: str, language: str) -> dict[str, Any]:
+    """The network boundary, isolated so tests can monkeypatch it without touching
+    urllib or performing a real HTTP request."""
+    params = deepgram_request_parameters(language)
     url = f"{DEEPGRAM_URL}?{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(
         url,
@@ -711,33 +856,78 @@ def _deepgram_request(audio_bytes: bytes, api_key: str, language: str) -> dict[s
 
 
 def transcribe_deepgram(audio: Path, api_key: str, language: str, target: Path) -> dict[str, Any]:
-    """One Deepgram request serves both ASR and diarization: the raw
-    response is written to `target` and doubles as the checkpoint for both stages —
-    whichever of them runs second reads it back from disk instead of paying for and
-    waiting on a second request. `target` is normally
-    `<job>/asr/deepgram-nova-3/meeting.json`, shared by name regardless of whether the
-    ASR stage actually requested deepgram-nova-3.
-    """
-    if target.exists():
-        return read_json(target)
+    """Share one verified response between ASR and diarization."""
     size = audio.stat().st_size
     if size > DEEPGRAM_MAX_UPLOAD_BYTES:
         raise RuntimeError(
             f"The concatenated track {size / 1024**3:.2f} GB exceeds the Deepgram limit of "
             f"{DEEPGRAM_MAX_UPLOAD_BYTES / 1024**3:.0f} GB per request."
         )
-    data = _deepgram_request(audio.read_bytes(), api_key, language)
-    atomic_json(target, data)
+    payload = audio.read_bytes()
+    fingerprint = deepgram_response_fingerprint(hashlib.sha256(payload).hexdigest(), language)
+    if (data := read_deepgram_response(target, fingerprint)) is not None:
+        return data
+    data = _deepgram_request(payload, api_key, language)
+    deepgram_words(data, duration=_wav_duration(audio))
+    _write_checkpoint(target, data, fingerprint, "_checkpoint")
     return data
 
 
-def deepgram_words(data: dict[str, Any]) -> list[dict[str, Any]]:
+def _json_digest(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, ensure_ascii=False).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def deepgram_response_fingerprint(audio_sha256: str, language: str) -> dict[str, Any]:
+    return {"wav_sha256": audio_sha256, "parameters": deepgram_request_parameters(language)}
+
+
+def read_deepgram_response(path: Path, fingerprint: dict[str, Any]) -> dict[str, Any] | None:
+    data = _read_checkpoint(path, fingerprint, "_checkpoint")
+    if data is None:
+        return None
+    data.pop("_checkpoint")
+    try:
+        deepgram_words(data)
+    except RuntimeError:
+        return None
+    return data
+
+
+def deepgram_speaker_label(word: dict[str, Any]) -> str | None:
+    speaker = word.get("speaker")
+    if speaker is None:
+        return None
+    if type(speaker) is not int or speaker < 0:
+        raise ValueError("Deepgram returned an invalid speaker label.")
+    return f"SPEAKER_{speaker:02d}"
+
+
+def deepgram_words(data: dict[str, Any], *, duration: float | None = None) -> list[dict[str, Any]]:
     """Words exactly as Deepgram ordered them — never re-sorted by timestamp (plan
     section 4; the same fix already applied for Whisper's out-of-order words)."""
     try:
-        return data["results"]["channels"][0]["alternatives"][0]["words"]
-    except (KeyError, IndexError) as exc:
-        raise RuntimeError("The Deepgram response has no words at the expected path.") from exc
+        alternative = data["results"]["channels"][0]["alternatives"][0]
+        words = alternative["words"]
+        if not isinstance(words, list):
+            raise TypeError("Expected a words list.")
+        if not words and str(alternative.get("transcript") or "").strip():
+            raise ValueError("Transcript is nonempty but word timestamps are missing.")
+        for word in words:
+            text = word.get("punctuated_word") or word.get("word")
+            start, end = _finite_time(word["start"]), _finite_time(word["end"])
+            if not isinstance(text, str) or not text.strip() or start < 0 or end < start:
+                raise ValueError("Invalid word text or interval.")
+            if duration is not None and (start >= duration or end > duration + 0.05):
+                raise ValueError("Word times are outside the decoded meeting duration.")
+            if word.get("confidence") is not None:
+                confidence = word["confidence"]
+                if type(confidence) not in (int, float) or not 0 <= confidence <= 1:
+                    raise ValueError("Invalid word confidence.")
+            deepgram_speaker_label(word)
+        return words
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError("The Deepgram response does not contain valid words.") from exc
 
 
 def deepgram_words_for_source(
@@ -772,6 +962,7 @@ def deepgram_words_for_source(
                         duration,
                     ),
                     "probability": word.get("confidence"),
+                    **({"speaker": word["speaker"]} if word.get("speaker") is not None else {}),
                 }
             )
     return result
@@ -792,6 +983,8 @@ def transcribe_part(
     vad_model_path: Path | None = None,
     local_fingerprint: dict[str, Any] | None = None,
     model_name: str = "",
+    pcm_fingerprint: dict[str, Any] | None = None,
+    resume: bool = True,
 ) -> dict[str, Any]:
     if provider not in ASR_PROVIDERS:
         raise ValueError(f"Unknown ASR provider: {provider}")
@@ -805,9 +998,12 @@ def transcribe_part(
             vad_model_path=vad_model_path,
             fingerprint=local_fingerprint,
             model_name=model_name,
+            resume=resume,
         )
     duration = _wav_duration(audio)
-    chunk_minutes = min(chunk_minutes or 10, GROQ_FREE_MAX_CHUNK_SECONDS // 60)
+    request_fp = groq_request_fingerprint(language, prompt, chunk_minutes)
+    chunk_minutes = request_fp["chunk_minutes"]
+    audio_identity = pcm_fingerprint if pcm_fingerprint is not None else {"sha256": sha256(audio)}
     cache = output.parent / "chunks" / output.stem
     combined: dict[str, Any] = {"segments": [], "words": [], "text": "", "chunks": []}
     for index, start in enumerate(range(0, int(duration) + 1, chunk_minutes * 60), 1):
@@ -815,7 +1011,17 @@ def transcribe_part(
         if length <= 0:
             continue
         chunk, result_path = cache / f"{index:03d}.wav", cache / f"{index:03d}.json"
-        if not result_path.exists():
+        chunk_fp = {
+            "pcm": audio_identity,
+            **request_fp,
+            "start": start,
+            "length": length,
+            "schema": ASR_OUTPUT_SCHEMA_VERSION,
+        }
+        value = (
+            _read_checkpoint(result_path, chunk_fp, "checkpoint_fingerprint") if resume else None
+        )
+        if value is None:
             chunk.parent.mkdir(parents=True, exist_ok=True)
             completed = subprocess.run(
                 [
@@ -828,7 +1034,7 @@ def transcribe_part(
                     "-ss",
                     str(start),
                     "-t",
-                    str(length),
+                    f"{length:.9f}",
                     "-i",
                     str(audio),
                     "-ac",
@@ -847,8 +1053,15 @@ def transcribe_part(
                 raise RuntimeError(
                     f"Failed to prepare ASR chunk {index}: {completed.stderr.strip()}"
                 )
-            _transcribe_groq(chunk, result_path, language, prompt, limiter=groq_limiter)
-        value = _shift_timestamps(read_json(result_path), float(start))
+            value = _transcribe_groq(
+                chunk,
+                result_path,
+                language,
+                prompt,
+                limiter=groq_limiter,
+                checkpoint_fingerprint=chunk_fp,
+            )
+        value = _shift_timestamps(value, float(start))
         combined["segments"].extend(value.get("segments", []))
         combined["words"].extend(value.get("words", []))
         combined["text"] += value.get("text", "")
@@ -873,7 +1086,7 @@ def transcribe_part(
     return combined
 
 
-def words_from_asr(data: dict[str, Any]) -> list[dict[str, Any]]:
+def words_from_asr(data: dict[str, Any], *, native_speakers: bool = False) -> list[dict[str, Any]]:
     root_words = data.get("words", [])
     if root_words:
         result = []
@@ -889,6 +1102,8 @@ def words_from_asr(data: dict[str, Any]) -> list[dict[str, Any]]:
                     "probability": word.get("probability"),
                 }
             )
+            if native_speakers and (speaker := deepgram_speaker_label(word)) is not None:
+                result[-1]["speaker_id"] = speaker
         return result
     return [
         {

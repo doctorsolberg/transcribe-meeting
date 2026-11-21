@@ -10,7 +10,6 @@ import traceback
 from getpass import getpass
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import urlparse
 
 import typer
 from rich import print
@@ -27,7 +26,6 @@ from .asr import (
     GROQ_ASR_MODEL_NAME,
     GROQ_FREE_AUDIO_SECONDS_PER_DAY,
     GROQ_FREE_MAX_CHUNK_SECONDS,
-    VAD_REPOSITORY,
     degrade_deepgram_without_key,
     degrade_groq_without_key,
     effective_asr_device,
@@ -48,18 +46,21 @@ from .core import (
     estimate_working_bytes,
     glossary,
     prepare_review,
+    render_all,
+    restore_readable_exports,
     route_readiness,
     run_job,
-    run_readable,
     try_readable,
     write_glossary,
 )
 from .core import refine as refine_review
 from .core import rename as rename_speakers
 from .diarization import DEEPGRAM_REPO, DIARIZATION_PROVIDERS, FOXNOSE_REPO, PYANNOTE_REPO
+from .readable import readable_readiness, validate_readable_base_url
+from .readable_publish import job_transaction, recover_readable_publication
 from .result import write_job_result
 from .secrets import PROJECT_ENV_NAMES, load_project_secrets, save_project_secret
-from .util import atomic_json, read_json
+from .util import read_json
 
 #: Interpreters the project is tested against: both resolve the lock and pass the
 #: full suite. Model inference itself has only been exercised on 3.12 (see README).
@@ -67,7 +68,7 @@ SUPPORTED_PYTHON = ((3, 12), (3, 13))
 
 app = typer.Typer(
     no_args_is_help=True,
-    help="Meeting transcription: local by default, Groq only with an explicit option.",
+    help="Local ASR by default. Readable cleanup can send text to a configured LLM endpoint.",
 )
 glossary_app = typer.Typer(no_args_is_help=True)
 app.add_typer(glossary_app, name="glossary")
@@ -297,24 +298,15 @@ def _check_route_ready(asr_models: list[str], diarization_provider: str) -> None
     covers part of the registry). This raises the same BadParameter deepgram
     diarization already got, but for every route, naming the exact command.
     """
-    status = route_readiness(asr_models, diarization_provider)
+    try:
+        status = route_readiness(asr_models, diarization_provider)
+    except RuntimeError as exc:
+        raise typer.BadParameter(str(exc)) from None
     if not status["route_ready"]:
         raise typer.BadParameter(
             "Route not ready; the run was cancelled before creating the job or "
             "decoding audio:\n" + "\n".join(status["problems"])
         )
-
-
-def _validate_clean_options(clean: str) -> list[str]:
-    modes = _parse_clean(clean)
-    if "readable" in modes and not os.environ.get("OPENAI_API_KEY"):
-        # A local transcript must never depend on an external model being configured.
-        print(
-            "[yellow]readable skipped:[/] OPENAI_API_KEY is missing. "
-            "raw and light will be created; readable can be added later with the clean command."
-        )
-        modes = [item for item in modes if item != "readable"] or ["raw", "light"]
-    return modes
 
 
 def _validate_speakers(speakers: str, min_speakers: int, max_speakers: int) -> int | None:
@@ -361,6 +353,7 @@ def _require_job_dir(job_dir: Path) -> None:
     """
     if not job_dir.is_dir():
         raise typer.BadParameter(f"Job folder not found: {job_dir}")
+    recover_readable_publication(job_dir)
 
 
 def _existing_speaker_names(job_dir: Path) -> dict[str, str]:
@@ -498,6 +491,14 @@ def _print_run_configuration(
     table = Table(title="Run parameters", show_header=True, header_style="bold cyan")
     table.add_column("Parameter", style="bold")
     table.add_column("Value used")
+    readable_rows = []
+    modes = config["clean"]
+    if isinstance(modes, list) and "readable" in modes:
+        endpoint = readable_readiness()
+        if endpoint.ready:
+            readable_rows.append(("Privacy", f"Readable sends transcript text to {endpoint.host}"))
+        elif endpoint.diagnostic:
+            readable_rows.append(("Readable", endpoint.diagnostic))
     values = [
         ("Source files", ", ".join(str(path) for path in parts)),
         ("Meeting name", meeting_name),
@@ -511,7 +512,7 @@ def _print_run_configuration(
         ("ASR backend", config["asr_backend"]),
         ("ASR models", _asr_models_display(config["asr_models"])),
         *(
-            [("Warning", "Audio will be sent to Groq")]
+            [("Warning", "Audio and any recognition prompt will be sent to Groq")]
             if any(ASR_MODELS[name]["provider"] == "groq" for name in config["asr_models"])
             else []
         ),
@@ -522,6 +523,7 @@ def _print_run_configuration(
             else []
         ),
         ("ASR device (requested)", config["asr_device"]),
+        *readable_rows,
         (
             "Diarization (provider/model)",
             f"{config['diarization_provider']} / {config['diarization_model']}",
@@ -568,14 +570,11 @@ def set_api_key(
 @auth_app.command("set-openai-base-url")
 def set_openai_base_url() -> None:
     """Save an OpenAI-compatible API URL to the project's .env."""
-    value = input("OPENAI_BASE_URL: ").strip().rstrip("/")
-    parsed = urlparse(value)
-    if parsed.scheme not in {"https", "http"} or not parsed.netloc:
-        raise typer.BadParameter("Enter a full URL, e.g. https://provider.example/v1")
     try:
+        value = validate_readable_base_url(input("OPENAI_BASE_URL: "))
         save_project_secret("OPENAI_BASE_URL", value)
     except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        raise typer.BadParameter(str(exc)) from None
     os.environ["OPENAI_BASE_URL"] = value
     print("OPENAI_BASE_URL saved to the project's .env with 600 permissions.")
 
@@ -626,9 +625,12 @@ def _finish_readable(job: Path, llm_model: str | None = None) -> None:
     since the cause is usually a missing key or an unreachable endpoint.
     """
     manifest = read_json(job / "manifest.json")
-    if "readable" not in (manifest["config"].get("clean") or []):
+    status = (manifest.get("readable") or {}).get("status")
+    if status == "no speech":
         return
-    if (manifest.get("readable") or {}).get("status") == "complete":
+    if status in {"complete", "partial"} and restore_readable_exports(job):
+        return
+    if "readable" not in (manifest["config"].get("clean") or []):
         return
     if not try_readable(job, llm_model):
         print(
@@ -656,14 +658,24 @@ def doctor(
     if diarization_provider not in DIARIZATION_PROVIDERS:
         raise typer.BadParameter("--diarization-provider: pyannote, foxnose, or deepgram")
     parsed_asr_models = _parse_asr_models(asr_models)
-    route = route_readiness(parsed_asr_models, diarization_provider)
+    try:
+        route = route_readiness(parsed_asr_models, diarization_provider)
+    except RuntimeError as exc:
+        route = {
+            "local_asr_models": {},
+            "asr_keys": {},
+            "vad_ready": False,
+            "diarization_ready": False,
+            "route_ready": False,
+            "problems": [str(exc)],
+        }
     checks = {
         "python_supported": sys.version_info[:2] in SUPPORTED_PYTHON,
         # Informational only: the server this runs on has no GPU at
         # all, so architecture must never gate setup or doctor's exit code.
         "apple_silicon": platform.machine() == "arm64",
         "ffmpeg": bool(shutil.which("ffmpeg") and shutil.which("ffprobe")),
-        "free_space_ge_7gb": _free_space_bytes(paths.data_root()) >= 7 * 1024**3,
+        "free_space_ge_7gb": _free_space_bytes(paths.models_dir()) >= 7 * 1024**3,
         # Route-specific: which local models are actually on disk
         # and which keys are set, never printing a value — only key presence.
         "asr_models": route["local_asr_models"],
@@ -678,20 +690,20 @@ def doctor(
     # goes. typer.echo, not rich's print: rich wraps long lines at 80 columns and a
     # wrapped line is invalid JSON (reproduced on a long readable.error in `status`).
     typer.echo(json.dumps(checks, ensure_ascii=False, indent=2))
-    base_ready = all(checks[key] for key in ("python_supported", "ffmpeg", "free_space_ge_7gb"))
+    # The download budget doesn't determine whether installed models can run.
+    base_ready = checks["python_supported"] and checks["ffmpeg"]
     if not base_ready or not route["route_ready"]:
         for problem in route["problems"]:
-            CONSOLE.print(f"[yellow]{problem}[/]")
+            CONSOLE.print(problem, style="yellow", markup=False)
         raise typer.Exit(1)
 
 
 @app.command()
 def setup(
     diarization_provider: str = typer.Option(
-        "all",
+        "foxnose",
         "--diarization-provider",
-        help="What to download for diarization: pyannote, foxnose, or all (both by "
-        "default). deepgram downloads nothing (it's an API) — no need to specify it here.",
+        help="What to download for diarization: foxnose (default), pyannote, or all (both).",
     ),
     asr_models: str = typer.Option(
         ",".join(DEFAULT_ASR_MODELS),
@@ -703,47 +715,32 @@ def setup(
             "is written to models.lock.json."
         ),
     ),
+    with_vad: bool = typer.Option(
+        False, "--with-vad", help="Also prepare VAD for overlap detection with network-only ASR."
+    ),
 ) -> None:
-    """Download models into local storage. Requires HF_TOKEN: VAD segmentation-3.0
-    is needed by local ASR. Community-1's terms are needed only for the pyannote route."""
+    """Prepare and verify models. HF_TOKEN is needed only for missing gated downloads."""
     if diarization_provider not in ("pyannote", "foxnose", "all"):
         raise typer.BadParameter("--diarization-provider: pyannote, foxnose, or all")
     requested_asr_models = _parse_asr_models(asr_models)
     want_pyannote = diarization_provider in ("pyannote", "all")
     want_foxnose = diarization_provider in ("foxnose", "all")
-    check_ffmpeg()
+    try:
+        check_ffmpeg()
+    except AudioError as exc:
+        raise typer.BadParameter(str(exc)) from None
     # Architecture is informational only: this must run unmodified
     # on a Linux/CPU-only server, so nothing here may gate on platform.machine().
     if sys.version_info[:2] not in SUPPORTED_PYTHON:
         wanted = " or ".join(f"{a}.{b}" for a, b in SUPPORTED_PYTHON)
         raise typer.BadParameter(f"Python {wanted} is required: `uv sync --python 3.12`.")
-    if shutil.disk_usage(paths.data_root()).free < 7 * 1024**3:
-        raise typer.BadParameter(
-            "At least 7 GB of free space is needed for GigaAM, VAD, the chosen "
-            "diarization model, and the working WAV."
-        )
-    token = os.environ.get("HF_TOKEN")
-    if not token:
-        if want_pyannote:
-            raise typer.BadParameter(
-                "First accept the terms of both models: "
-                "https://huggingface.co/pyannote/segmentation-3.0 and "
-                "https://huggingface.co/pyannote/speaker-diarization-community-1, "
-                "then set HF_TOKEN in the environment. Never pass the token in arguments or chat. "
-                "To avoid accepting Community-1's terms, use "
-                "`setup --diarization-provider foxnose` — this is the default diarization route."
-            )
-        raise typer.BadParameter(
-            "First accept the terms of the model "
-            "https://huggingface.co/pyannote/segmentation-3.0 "
-            "(needed by local ASR's VAD), then set HF_TOKEN in the environment. "
-            "Never pass the token in arguments or chat."
-        )
+
+    token = os.environ.get("HF_TOKEN", "")
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
         raise typer.BadParameter("huggingface_hub is missing; run uv sync.") from exc
-    paths.models_dir().mkdir(parents=True, exist_ok=True)
+
     requested_local_models = [
         name for name in requested_asr_models if ASR_MODELS[name]["provider"] == "local"
     ]
@@ -752,39 +749,48 @@ def setup(
         for name in requested_asr_models
         if ASR_MODELS[name]["provider"] in ("groq", "deepgram")
     ]
-    # provisioning has no typer dependency of its own, so its failures surface as
-    # RuntimeError; setup is the one place that turns them back into a BadParameter.
+    want_vad = bool(requested_local_models) or with_vad
+
+    def progress(message: str) -> None:
+        typer.echo(message, err=True)
+
     try:
-        gigaam_dir, downloaded_gigaam_models = provisioning.download_gigaam_models(
-            requested_local_models
+        if (
+            provisioning.setup_needs_downloads(
+                local_models=requested_local_models,
+                want_vad=want_vad,
+                want_pyannote=want_pyannote,
+                want_foxnose=want_foxnose,
+            )
+            and _free_space_bytes(paths.models_dir()) < 7 * 1024**3
+        ):
+            raise typer.BadParameter("At least 7 GiB of free space is needed to download models.")
+        provisioning.check_huggingface_access(
+            token=token, want_pyannote=want_pyannote, want_vad=want_vad
         )
-    except RuntimeError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    # Never print, save, or embed token outside these authenticated download calls.
-    hf_cache = paths.models_dir() / "huggingface"
-    os.environ["HF_HOME"] = str(hf_cache)
-    vad = snapshot_download(VAD_REPOSITORY, cache_dir=hf_cache, token=token)
-
-    # Read from lock_path() (old or new location,) but always write
-    # below to the new canonical models_dir()/models.lock.json — this is how a
-    # project naturally migrates onto the new layout the first time setup runs again.
-    new_models = provisioning.asr_lock_entries(
-        gigaam_dir, downloaded_gigaam_models, vad, requested_network_models
-    )
-    diarization_entries, pyannote_path, wespeaker_path = provisioning.download_diarization_models(
-        want_pyannote=want_pyannote,
-        want_foxnose=want_foxnose,
-        token=token,
-        snapshot_download=snapshot_download,
-    )
-    new_models.update(diarization_entries)
-    lock_target = provisioning.write_lock(new_models)
-
-    # A generated local WAV proves loading and offline execution without uploading user audio.
-    try:
+        vad = (
+            provisioning.download_vad_model(token=token, snapshot_download=snapshot_download)
+            if want_vad
+            else None
+        )
+        diarization_entries, pyannote_path, wespeaker_path = (
+            provisioning.download_diarization_models(
+                want_pyannote=want_pyannote,
+                want_foxnose=want_foxnose,
+                token=token,
+                snapshot_download=snapshot_download,
+                progress=progress,
+            )
+        )
+        gigaam_dir, downloaded_gigaam_models = provisioning.download_gigaam_models(
+            requested_local_models, progress=progress
+        )
+        new_models = provisioning.asr_lock_entries(
+            gigaam_dir, downloaded_gigaam_models, vad, requested_network_models
+        )
+        new_models.update(diarization_entries)
         new_smoke = provisioning.run_smoke_tests(
             requested_local_models=requested_local_models,
-            requested_asr_models=requested_asr_models,
             gigaam_dir=gigaam_dir,
             vad_path=vad,
             want_pyannote=want_pyannote,
@@ -792,14 +798,16 @@ def setup(
             pyannote_path=pyannote_path,
             wespeaker_path=wespeaker_path,
         )
+        provisioning.write_lock(new_models, smoke=new_smoke)
     except RuntimeError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    lock = read_json(lock_target)
-    lock["smoke"] = {**lock.get("smoke", {}), **new_smoke}
-    atomic_json(lock_target, lock)
+        raise typer.BadParameter(str(exc)) from None
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"Cannot prepare models under {paths.models_dir()}: {exc}"
+        ) from None
     print(
-        "Models downloaded and verified locally. HF_TOKEN can be removed from the "
-        "environment; a normal run works offline."
+        "Selected local models verified. For offline transcription, select local ASR and "
+        "diarization with --clean raw,light."
     )
 
 
@@ -823,7 +831,8 @@ def run(
     clean: str = typer.Option(
         "raw,light,readable",
         help="Comma-separated outputs: raw, light, and/or readable. readable requires "
-        "OPENAI_API_KEY and network access; without it, raw and light remain.",
+        "an LLM endpoint; if it is unavailable, raw and light remain. "
+        "Use raw,light to skip LLM requests.",
     ),
     profile: str = typer.Option("balanced", help="Resource profile: background, balanced, or max."),
     asr_provider: str | None = typer.Option(
@@ -951,7 +960,7 @@ def run(
     # dropped network models never reach here (already removed above), so this only
     # ever catches a missing local checkpoint or a missing diarization model.
     _check_route_ready(parsed_asr_models, diarization_provider)
-    modes = _validate_clean_options(clean)
+    modes = _parse_clean(clean)
     speaker_count = _validate_speakers(speakers, min_speakers, max_speakers)
     missing = [str(part) for part in parts if not part.is_file()]
     if missing:
@@ -1044,13 +1053,14 @@ def run(
         print(f"[red]The run stopped with an error:[/] {exc}")
         print(f"Details: {job / 'error.log'}; continue with: transcribe-meeting resume {job}")
         raise typer.Exit(1) from exc
-    write_job_result(job)
+    with job_transaction(job):
+        write_job_result(job)
     print(f"Done: {job}")
 
 
 @app.command()
 def status(job_dir: Annotated[Path, typer.Argument(help="Job folder from output/. ")]) -> None:
-    """Show the manifest and completed atomic stages."""
+    """Show the job ID, completed stages, and readable status as JSON."""
     _require_job_dir(job_dir)
     manifest = read_json(job_dir / "manifest.json")
     markers = (
@@ -1074,7 +1084,7 @@ def status(job_dir: Annotated[Path, typer.Argument(help="Job folder from output/
 
 @app.command()
 def resume(
-    job_dir: Annotated[Path, typer.Argument(help="Existing folder of an unfinished job.")],
+    job_dir: Annotated[Path, typer.Argument(help="Existing job folder, unfinished or completed.")],
     cpu_threads: int | None = typer.Option(
         None, help="Temporary CPU thread count for this resume; the manifest is not changed."
     ),
@@ -1087,18 +1097,24 @@ def resume(
         raise typer.BadParameter("--cpu-threads must be at least 1")
     if ffmpeg_threads is not None and ffmpeg_threads < 1:
         raise typer.BadParameter("--ffmpeg-threads must be at least 1")
-    run_job(
-        job_dir,
-        resume=True,
-        cpu_threads_override=cpu_threads,
-        ffmpeg_threads_override=ffmpeg_threads,
-    )
-    # The readable pass the job was configured for, if the interrupt landed before it.
-    _finish_readable(job_dir)
-    # A job interrupted mid-run (Ctrl-C in `run`) never reached run's own
-    # write_job_result call; resume is what finishes it, so it must write result.json
-    # itself too — otherwise a resumed-to-completion job would have none at all.
-    write_job_result(job_dir)
+    try:
+        run_job(
+            job_dir,
+            resume=True,
+            cpu_threads_override=cpu_threads,
+            ffmpeg_threads_override=ffmpeg_threads,
+            preserve_published=True,
+        )
+        _finish_readable(job_dir)
+        with job_transaction(job_dir):
+            write_job_result(job_dir)
+    except KeyboardInterrupt:
+        CONSOLE.print("Resume interrupted; the job can be resumed again.")
+        raise typer.Exit(130) from None
+    except (OSError, KeyError, RuntimeError, ValueError, TypeError) as exc:
+        (job_dir / "error.log").write_text(traceback.format_exc(), encoding="utf-8")
+        CONSOLE.print(f"Resume failed: {exc}", markup=False)
+        raise typer.Exit(1) from None
     print(f"Done: {job_dir}")
 
 
@@ -1147,19 +1163,20 @@ def clean(
     ),
     llm_model: str | None = typer.Option(None, help="Override the LLM only for this readable run."),
 ) -> None:
-    """Re-render raw/light, or run the explicitly requested external readable cleanup."""
+    """Re-render raw/light or run the requested LLM cleanup."""
     _require_job_dir(job_dir)
     modes = _parse_clean(mode)
-    if "readable" in modes:
-        try:
-            run_readable(job_dir, llm_model)
-        except RuntimeError as exc:
-            print(f"[yellow]readable pending:[/] {exc}")
-            raise typer.Exit(2) from exc
-    from .core import render_all
-
-    render_all(job_dir, [item for item in modes if item != "readable"])
-    write_job_result(job_dir)
+    local_modes = [item for item in modes if item != "readable"]
+    with job_transaction(job_dir):
+        if not (job_dir / "canonical.json").is_file():
+            raise typer.BadParameter("This job has no transcript yet. Run resume first.")
+        if local_modes:
+            render_all(job_dir, local_modes)
+    success = "readable" not in modes or try_readable(job_dir, llm_model)
+    with job_transaction(job_dir):
+        write_job_result(job_dir)
+    if not success:
+        raise typer.Exit(2)
 
 
 @app.command()

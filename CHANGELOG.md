@@ -5,16 +5,28 @@ versioning — [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `readable` supports OpenAI-compatible Chat Completions, JSON object mode, and a configurable batch size. The default remains Responses with strict JSON schema.
+- `setup` shows download progress and accepts a trusted HTTPS mirror for GigaAM checkpoints.
+- `setup --with-vad` provisions optional overlap detection for network-only ASR. A complete local model cache can be verified without Hub access or an HF token.
+
+### Changed
+
+- `setup` defaults to `foxnose`, matching `run`. Use `setup --diarization-provider all` for both local diarizers.
+- Moved the historical measurements to [benchmark notes](docs/benchmarks.md). The default cleanup modes remain `raw,light,readable`.
+- CI installs with `uv sync --locked` and checks that `doctor` reports an unprovisioned checkout as not ready. Package builds do not validate standalone installation or inference.
+
 ### Fixed
 
-- **`resume` skipped the `readable` pass.** The LLM cleanup runs outside
-  `run_job` and has no `.stages/` marker, so a job interrupted before it
-  and then resumed finished the local stages, printed `Done` and exited 0
-  without ever producing `transcript.readable.md` — the only trace was a
-  warning inside `result.json`. `resume` now runs the pass the job's
-  manifest asked for, before writing `result.json`. A pass already
-  recorded as complete is not repeated (resuming a finished job must not
-  spend the tokens twice); a failed one is retried.
+- Local model stages read working WAV files without requiring a torchcodec FFmpeg decoder.
+- `setup` explains Hugging Face access and model download failures, handles new data directories, and records model verification only after smoke tests pass.
+- `resume` checks the inputs for individual checkpoints instead of reusing cached outputs based on file existence alone.
+- `resume` verifies the published canonical transcript and repairs derived files without re-reading the original audio or rerunning recognition. Start a new job to reprocess audio.
+- A missing readable key no longer drops the requested mode; a later `resume` can retry it. Failed batches can leave a first readable version partial, but do not replace a complete accepted version.
+- `resume` restores readable exports added by `clean`, and later LLM passes leave text corrected by `refine` untouched.
+- Readable requires HTTPS for remote endpoints and does not follow redirects. Literal loopback addresses can be used over HTTP and without a key.
+- The offline comparison scripts report undefined metrics on empty input, show ASR variant coverage, and use exact speaker matching without enumerating permutations.
 
 ## [1.0.0] — 2026-08-23
 
@@ -38,9 +50,8 @@ First public release. Everything below is relative to internal version
   the request actually makes sense.
 - **`status` and `doctor` printed invalid JSON.** Output went through
   `rich`, which wraps long lines to the terminal width; a line wrapped in
-  the middle of a value doesn't parse. Machine-readable output (`status`,
-  `doctor`, `auth status`, `glossary list`) now goes through plain
-  `stdout`.
+  the middle of a value doesn't parse. `status`, `doctor`, and `auth status`
+  write JSON to plain `stdout`; `glossary list` writes YAML.
 - **Hints on `stderr` broke mid-command** and couldn't be copy-pasted —
   `soft_wrap` was added.
 - **`clean`, `review`, `resume`, `rename` on a nonexistent job folder**
@@ -142,9 +153,7 @@ First public release. Everything below is relative to internal version
   tied to slots "a" and "b," and swapping the models silently flipped the
   prompt's hints in the wrong direction.
 - `scripts/model_agreement.py` and `scripts/compare_routes.py` — tools to
-  re-check the numbers in the README's "Measured Facts" section.
-  Previously these numbers couldn't be reproduced: the measurement tooling
-  wasn't part of the repository.
+  compare stored jobs offline; see [benchmark notes](docs/benchmarks.md).
 - The `TRANSCRIBE_READABLE_REASONING` environment variable
   (`none|low|medium|high`, default `medium`). The `reasoning` value used to
   be sent unconditionally and broke OpenAI-compatible endpoints that don't
@@ -156,8 +165,7 @@ First public release. Everything below is relative to internal version
   README's option tables against the CLI's real parameters in both
   directions — this project's documentation had already drifted from the
   code once without it, and would drift again.
-- The `requires_ffmpeg` marker: two tests call the real binary and now get
-  skipped, instead of failing, when it isn't present.
+- Audio preprocessing tests that call real FFmpeg skip when it is absent.
 - `numpy` is now declared as an explicit dependency — the code imports it
   directly, but it had been riding along transitively.
 

@@ -2,9 +2,9 @@ import csv
 
 import yaml
 
-from transcribe_meeting.core import _load_utterances, prepare_review, refine
+from transcribe_meeting.core import _load_utterances, prepare_review, refine, render_all
 from transcribe_meeting.model import Utterance
-from transcribe_meeting.util import atomic_json, atomic_text
+from transcribe_meeting.util import atomic_json, atomic_text, read_json
 
 
 def _job(tmp_path):
@@ -146,3 +146,24 @@ def test_refine_text_and_speaker_apply_together_in_one_command(tmp_path):
     assert item.raw_text == "починенный текст"
     assert item.speaker_name == "Пётр"
     assert item.speaker_id == "SPEAKER_01"
+
+
+def test_refine_applies_manual_text_to_an_existing_readable_transcript(tmp_path):
+    job = _job(tmp_path)
+    canonical = read_json(job / "canonical.json")
+    for utterance, text in zip(canonical["utterances"], ["Ошибка.", "Текст два."], strict=True):
+        utterance["readable_text"] = text
+    atomic_json(job / "canonical.json", canonical)
+    manifest = read_json(job / "manifest.json")
+    manifest["readable"] = {"status": "complete", "changed_utterances": 1}
+    atomic_json(job / "manifest.json", manifest)
+    render_all(job, ["readable"])
+    review_csv = _write_review(job, [{"utterance_id": "p001-u00001", "replacement": "Поправка."}])
+
+    refine(job, review_csv)
+
+    readable = (job / "transcript.readable.md").read_text(encoding="utf-8")
+    assert "Поправка." in readable
+    assert "Ошибка." not in readable
+    assert "Текст два." in readable
+    assert "p001-u00001" not in (job / "review/readable_changes.csv").read_text(encoding="utf-8")

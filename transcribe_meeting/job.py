@@ -19,7 +19,7 @@ from typing import Any
 
 from .model import Utterance
 from .paths import lock_path, models_dir, resolve_model_path
-from .util import atomic_json, read_json
+from .util import atomic_json, read_json, sha256
 
 # Paths already warned about in this process, so a job that calls model_lock()
 # several times (create_job, then again per stage in run_job) does not repeat the
@@ -39,7 +39,22 @@ def model_lock() -> dict[str, Any]:
             f"{canonical}: the lock describes the models directory's contents and must "
             "travel with it."
         )
-    return read_json(path) if path.exists() else {"models": {}}
+    if not path.exists():
+        return {"models": {}}
+    try:
+        payload = read_json(path)
+        entries = payload.get("models")
+        if not isinstance(entries, dict) or any(
+            not isinstance(entry, dict)
+            or (entry.get("path") is not None and not isinstance(entry["path"], str))
+            for entry in entries.values()
+        ):
+            raise ValueError
+    except (AttributeError, OSError, ValueError):
+        raise RuntimeError(
+            f"Cannot read {path}: invalid model metadata. Restore it or rerun setup."
+        ) from None
+    return payload
 
 
 def _model_path(info: dict[str, Any], default_relative: str) -> Path:
@@ -61,17 +76,38 @@ def _as_stored(fingerprint: dict[str, Any]) -> Any:
     return json.loads(json.dumps(fingerprint, ensure_ascii=False, sort_keys=True))
 
 
-def stage_valid(job: Path, stage: str, fingerprint: dict[str, Any]) -> bool:
+def stage_valid(job: Path, stage: str, fingerprint: dict[str, Any], *products: Path) -> bool:
     marker = job / ".stages" / f"{stage}.json"
-    if not marker.exists():
+    if not all(product.is_file() for product in products):
         return False
-    return read_json(marker).get("fingerprint") == _as_stored(fingerprint)
+    try:
+        data = read_json(marker)
+        if not isinstance(data, dict) or data.get("fingerprint") != _as_stored(fingerprint):
+            return False
+        hashes = data.get("product_hashes", {})
+        return all(
+            hashes.get(str(product.relative_to(job))) == sha256(product)
+            for product in products
+            if product.name != "canonical.json"
+        )
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
-def complete_stage(job: Path, stage: str, fingerprint: dict[str, Any]) -> None:
+def invalidate_stage(job: Path, stage: str) -> None:
+    (job / ".stages" / f"{stage}.json").unlink(missing_ok=True)
+
+
+def complete_stage(job: Path, stage: str, fingerprint: dict[str, Any], *products: Path) -> None:
     atomic_json(
         job / ".stages" / f"{stage}.json",
-        {"fingerprint": fingerprint, "completed_at": dt.datetime.now(dt.UTC).isoformat()},
+        {
+            "fingerprint": fingerprint,
+            "completed_at": dt.datetime.now(dt.UTC).isoformat(),
+            "product_hashes": {
+                str(product.relative_to(job)): sha256(product) for product in products
+            },
+        },
     )
 
 
@@ -84,6 +120,36 @@ def complete_stage(job: Path, stage: str, fingerprint: dict[str, Any]) -> None:
 #: raised a raw TypeError instead of a readable error. See the version==1 branch
 #: below for why that does not lock the eight real jobs already on disk out.
 CANONICAL_SCHEMA_VERSION = 2
+
+
+def mark_published(job: Path) -> None:
+    atomic_json(
+        job / ".stages" / "published.json",
+        {"canonical_sha256": sha256(job / "canonical.json")},
+    )
+
+
+def has_published_transcript(job: Path) -> bool:
+    canonical = job / "canonical.json"
+    marker = job / ".stages" / "published.json"
+    result = job / "result.json"
+    if marker.is_file():
+        expected = read_json(marker).get("canonical_sha256")
+        if not canonical.is_file() or sha256(canonical) != expected:
+            raise RuntimeError(
+                "The published canonical.json is missing or changed. Restore it from backup."
+            )
+        return True
+    if not (result.is_file() or (job / ".stages" / "align.json").is_file()):
+        return False
+    if not canonical.is_file():
+        raise RuntimeError("The published canonical.json is missing. Restore it from backup.")
+    # Older jobs have no digest, but a valid accepted document is still not a cache.
+    utterances = load_utterances(job)
+    if result.is_file() and not utterances and read_json(result).get("utterances"):
+        raise RuntimeError("Published canonical.json lost its utterances. Restore it from backup.")
+    return True
+
 
 #: Job directories already warned about a legacy (schema_version 1) canonical.json
 #: in this process, so the warning prints once per job instead of on every stage

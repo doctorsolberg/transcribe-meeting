@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,7 +28,11 @@ class _FakeUsage:
 
 class _FakeResponse:
     def __init__(self, output_text, usage=None):
-        self.output_text = output_text
+        self.output = [
+            SimpleNamespace(
+                type="message", content=[SimpleNamespace(type="output_text", text=output_text)]
+            )
+        ]
         self.usage = _FakeUsage(usage) if usage is not None else None
 
 
@@ -86,6 +91,17 @@ def test_readable_rejects_lost_or_reordered_ids():
             ],
             set(),
         )
+
+
+def test_protected_link_cannot_be_extended_to_a_different_destination():
+    item = utterance("u1", "сайт https://example.test/private-route")
+    texts, rejected, _ = validate_readable(
+        [item],
+        [{"utterance_id": "u1", "readable_text": "Сайт https://example.test/private-route-2."}],
+        set(),
+    )
+    assert texts == {"u1": item.raw_text}
+    assert "private-route" not in repr(rejected)
 
 
 def test_readable_accepts_preserved_protected_data():
@@ -277,15 +293,46 @@ def test_transliteration_of_a_known_term_is_allowed_and_logged():
     assert "Whisper" in texts["u1"]
 
 
-def test_short_word_swaps_are_logged_as_substitutions_not_repairs():
-    """'не'->'но' is a meaning change; it may pass now, but never silently."""
-    item = utterance("u1", "у него и так рак не оно")
-
-    _, _, repairs = validate_readable(
-        [item], [{"utterance_id": "u1", "readable_text": "У него и так рак но оно."}], set()
+@pytest.mark.parametrize(
+    ("original", "edited"),
+    [
+        ("я не согласен", "Я согласен."),
+        ("да, согласен", "Да, я не согласен."),
+        ("не мы одобрили бюджет", "Мы не одобрили бюджет."),
+        ("я не согласен но он согласен", "Я согласен, но он не согласен."),
+        ("у него и так рак не оно", "У него и так рак но оно."),
+        ("we don’t agree", "We do agree."),
+        ("there is no delay", "There is a delay."),
+        ("я не подпишу", "Я не-подпишу."),
+    ],
+)
+def test_negation_change_keeps_local_text(original, edited):
+    item = utterance("u1", original)
+    texts, rejected, _ = validate_readable(
+        [item], [{"utterance_id": "u1", "readable_text": edited}], set()
     )
+    assert texts == {"u1": original}
+    assert rejected == {"u1": ["changed negation or its immediate context"]}
 
-    assert repairs == {"u1": ["+но"]}
+
+@pytest.mark.parametrize("reply", [".", "—…?!", "Проверили."])
+def test_readable_keeps_speech_when_a_reply_drops_most_words(reply):
+    item = utterance("u1", "проверили результаты работы всей команды")
+    item.variants = {"other": "проверили итог работы нашей группы"}
+    texts, rejected, _ = validate_readable(
+        [item], [{"utterance_id": "u1", "readable_text": reply}], set()
+    )
+    assert texts == {"u1": item.raw_text}
+    assert "u1" in rejected
+
+
+def test_punctuation_and_number_formatting_near_negation_are_allowed():
+    item = utterance("u1", "нет не  пять рублей")
+    texts, rejected, _ = validate_readable(
+        [item], [{"utterance_id": "u1", "readable_text": "Нет, не 5 рублей."}], set()
+    )
+    assert not rejected
+    assert texts == {"u1": "Нет, не 5 рублей."}
 
 
 def test_spelled_out_number_is_digitized_without_rejection():
@@ -300,17 +347,57 @@ def test_spelled_out_number_is_digitized_without_rejection():
     assert texts["u1"] == "Приехало 130 человек."
 
 
-def test_digit_token_is_always_accepted_even_without_a_matching_source_numeral():
-    """The model may normalize a number from a fused variant or context not literally
-    present in this utterance's own text; the digit-token exception is unconditional."""
-    item = utterance("u1", "приехало много человек")
-
+@pytest.mark.parametrize(
+    ("raw", "edited"),
+    [
+        ("приехало много человек", "Приехало 130 человек."),
+        ("встреча будет 15 числа", "Встреча будет 115 числа."),
+        ("отправили 42 заявки", "Отправили 42888 заявки."),
+        ("отправили 42 заявки", "Отправили 42 заявки и 888."),
+        ("5 плюс 5", "5 плюс."),
+        ("5 и 10 заявок", "10 и 5 заявок."),
+        ("сто тридцать человек", "Сто сорок человек."),
+        ("сто тридцать человек", "30 человек."),
+        ("цена -15 рублей", "Цена 15 рублей."),
+        ("версия 2.1.3", "Версия 2.13."),
+        ("модель GPT-5", "Модель GPT-6."),
+        ("срок 3–5 дней", "Срок 3, 5 дней."),
+        ("двадцать седьмого числа", "27 числа."),
+        ("27-го числа", "27-ой числа."),
+        ("one hundred thirty people", "Thirty people."),
+        ("бюджет - 15 рублей", "Бюджет 15 рублей."),
+        ("удержание 10 %", "Удержание 10."),
+        ("бюджет 25 ₽", "Бюджет 25 $."),
+        ("аня 5 борис 10", "Борис 5, Аня 10."),
+        ("выделили один миллион рублей", "Выделили один миллиард рублей."),
+        ("plan two million dollars", "Plan two billion dollars."),
+    ],
+)
+def test_changed_number_falls_back_with_sanitized_diagnostic(raw, edited):
+    item = utterance("u1", raw)
     texts, rejected, _ = validate_readable(
-        [item], [{"utterance_id": "u1", "readable_text": "Приехало 130 человек."}], set()
+        [item], [{"utterance_id": "u1", "readable_text": edited}], set()
     )
+    assert texts == {"u1": raw}
+    assert rejected == {"u1": ["changed numeric content"]}
 
-    assert rejected == {}
-    assert texts["u1"] == "Приехало 130 человек."
+
+@pytest.mark.parametrize(
+    ("raw", "edited"),
+    [
+        ("двадцать седьмого числа", "27-го числа."),
+        ("приехали с тридцатью человеками", "Приехали с 30 человеками."),
+        ("две тысячи двадцать шестой год", "2026 год."),
+        ("one hundred thirty people", "130 people."),
+        ("срок 3–5 дней", "Срок 3–5 дней."),
+    ],
+)
+def test_proven_number_formatting_is_preserved(raw, edited):
+    texts, rejected, _ = validate_readable(
+        [utterance("u1", raw)], [{"utterance_id": "u1", "readable_text": edited}], set()
+    )
+    assert not rejected
+    assert texts == {"u1": edited}
 
 
 def test_a_fabricated_word_is_still_flagged_not_silently_allowed_like_a_digit():
@@ -366,7 +453,7 @@ def test_a_lost_protected_value_degrades_only_that_utterance():
         set(),
     )
 
-    assert rejected["u1"] == ["lost protected value '15'"]
+    assert rejected["u1"] == ["changed numeric content"]
     assert texts["u1"] == "встреча пройдёт 15 числа"
     assert texts["u2"] == "Все согласны."
 
@@ -411,10 +498,11 @@ def test_fuse_batch_sends_the_documented_request_shape(monkeypatch):
         [_FakeResponse(_valid_payload_json(), usage={"input_tokens": 10, "output_tokens": 5})]
     )
 
-    texts, concerns, usage = _fuse_batch(client, "gpt-test", "SYSTEM", [item], set())
+    usage = {}
+    result = _fuse_batch(client, "gpt-test", "SYSTEM", [item], set(), usage=usage)
 
-    assert texts == {"u1": "Текст."}
-    assert concerns == []
+    assert result.texts == {"u1": "Текст."}
+    assert result.concerns == []
     assert usage == {"input_tokens": 10, "output_tokens": 5}
     assert len(client.responses.calls) == 1
     request = client.responses.calls[0]
@@ -435,7 +523,7 @@ def test_fuse_batch_omits_reasoning_when_level_is_none(monkeypatch):
     item = utterance("u1", "текст")
     client = _FakeClient([_FakeResponse(_valid_payload_json())])
 
-    _fuse_batch(client, "gpt-test", "SYSTEM", [item], set())
+    _fuse_batch(client, "gpt-test", "SYSTEM", [item], set(), usage={})
 
     assert "reasoning" not in client.responses.calls[0]
 
@@ -445,10 +533,10 @@ def test_fuse_batch_retries_once_on_invalid_json_then_succeeds(monkeypatch):
     item = utterance("u1", "текст")
     client = _FakeClient([_FakeResponse("not json"), _FakeResponse(_valid_payload_json())])
 
-    texts, concerns, _usage = _fuse_batch(client, "gpt-test", "SYSTEM", [item], set())
+    result = _fuse_batch(client, "gpt-test", "SYSTEM", [item], set(), usage={})
 
-    assert texts == {"u1": "Текст."}
-    assert concerns == []
+    assert result.texts == {"u1": "Текст."}
+    assert result.concerns == []
     assert len(client.responses.calls) == 2
     first_system = client.responses.calls[0]["input"][0]["content"]
     second_system = client.responses.calls[1]["input"][0]["content"]
@@ -463,7 +551,7 @@ def test_fuse_batch_raises_after_two_invalid_responses(monkeypatch):
     client = _FakeClient([_FakeResponse("not json"), _FakeResponse("still not json")])
 
     with pytest.raises(ValueError):
-        _fuse_batch(client, "gpt-test", "SYSTEM", [item], set())
+        _fuse_batch(client, "gpt-test", "SYSTEM", [item], set(), usage={})
 
     assert len(client.responses.calls) == 2
 
@@ -487,16 +575,91 @@ def test_fuse_batch_reports_fallback_and_repair_concerns_with_their_prefixes():
     )
     client = _FakeClient([_FakeResponse(payload)])
 
-    texts, concerns, _usage = _fuse_batch(
-        client, "gpt-test", "SYSTEM", [protected, repaired], set()
-    )
+    result = _fuse_batch(client, "gpt-test", "SYSTEM", [protected, repaired], set(), usage={})
 
-    assert texts["u1"] == "встреча пройдёт 15 числа"  # fell back to the local text
-    assert texts["u2"] == "Усвоил материал."
-    fallback_notes = [c for c in concerns if c["utterance_id"] == "u1"]
-    repair_notes = [c for c in concerns if c["utterance_id"] == "u2"]
+    assert result.texts["u1"] == "встреча пройдёт 15 числа"  # fell back to the local text
+    assert result.texts["u2"] == "Усвоил материал."
+    fallback_notes = [c for c in result.concerns if c["utterance_id"] == "u1"]
+    repair_notes = [c for c in result.concerns if c["utterance_id"] == "u2"]
     assert len(fallback_notes) == 1 and fallback_notes[0]["note"].startswith(CONCERN_FALLBACK)
     assert len(repair_notes) == 1 and repair_notes[0]["note"].startswith(CONCERN_REPAIR)
+
+
+def test_validator_counts_repaired_utterances_not_words_or_provider_notes():
+    items = [utterance("u1", "усвол материал в ранскрибаторе"), utterance("u2", "все хорошо")]
+    reply = ReadablePayload.model_validate(
+        {
+            "items": [
+                {
+                    "utterance_id": "u1",
+                    "readable_text": "Усвоил материал в транскрибаторе.",
+                    "concerns": [],
+                },
+                {
+                    "utterance_id": "u2",
+                    "readable_text": "Всё хорошо.",
+                    "concerns": [f"{CONCERN_REPAIR}: one", f"{CONCERN_REPAIR}: two"],
+                },
+            ]
+        }
+    )
+    result = _fuse_batch(
+        _FakeClient([_FakeResponse(reply.model_dump_json())]), "m", "prompt", items, set(), usage={}
+    )
+    assert result.repaired_utterances == 1
+
+
+def test_novel_word_is_audited_separately_from_a_proven_near_match():
+    item = utterance("u1", "мы очень смеялись")
+    client = _FakeClient([_FakeResponse(_valid_payload_json(text="Мы очень хохотали."))])
+    result = _fuse_batch(client, "m", "prompt", [item], set(), usage={})
+    assert result.repaired_utterances == 0
+    assert result.concerns == [
+        {"utterance_id": "u1", "note": "words outside the variants: +хохотали"}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw", "edited", "kinds", "removed"),
+    [
+        ("я помню да", "Я помню.", ["loss"], "да"),
+        ("я помню да", "Я помню, помню.", ["loss"], "да"),
+        ("мы снова снова здесь", "Мы снова здесь.", ["loss"], "снова"),
+        ("шли в лес впереди", "Шли впереди.", ["loss", "loss"], "лес"),
+        (
+            "мы шли на запад и смеялись",
+            "Мы шли и хохотали.",
+            ["substitution", "loss", "loss"],
+            "запад",
+        ),
+        ("это сверх сверхсложный тест", "Это сверхсложный тест.", ["loss"], "сверх"),
+        ("с супер разных сторон", "С суперразных сторон.", [], None),
+        ("сто тридцать человек", "130 человек.", ["number"], None),
+    ],
+)
+def test_removal_audit_tracks_exact_tokens_and_repetitions(raw, edited, kinds, removed):
+    from transcribe_meeting.readable import classify_changes
+
+    item = utterance("u1", raw)
+    item.readable_text = edited
+    assert classify_changes(item) == kinds
+    result = _fuse_batch(
+        _FakeClient([_FakeResponse(_valid_payload_json(text=edited))]),
+        "m",
+        "prompt",
+        [item],
+        set(),
+        usage={},
+    )
+    assert any(c["note"].startswith("removed source words:") for c in result.concerns) == (
+        removed is not None
+    )
+    if removed:
+        assert any(
+            removed in c["note"]
+            for c in result.concerns
+            if c["note"].startswith("removed source words:")
+        )
 
 
 def test_calibrated_model_order_produces_no_warning():

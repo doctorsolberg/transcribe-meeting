@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from difflib import SequenceMatcher
+from ipaddress import ip_address
+from typing import Any, TypedDict
+from urllib.parse import urlsplit
 
 from .model import Utterance
+from .readable_transport import EndpointError, UnusableReply, request_readable
+from .schemas import ReadablePayload
+from .secrets import OPENAI_ENV_CONFLICT
 
 # Verbatim: written for a cheap model, with numbered rules and
 # concrete divergence examples measured on a real recording.
@@ -105,14 +113,125 @@ class ReadableResult:
     texts: dict[str, str]
     concerns: list[dict[str, Any]]
     usage: dict[str, Any]
+    # None distinguishes older callers constructing a result without metrics.
+    accepted_utterances: int | None = None
+    fallback_utterances: int | None = None
+    api: str = "responses"
+    response_format: str = "json_schema"
+    provider: str = "openai"
+    repaired_utterances: int | None = None
+    endpoint_failure: str | None = None
+    pending_utterance_ids: list[str] | None = None
 
 
-def openai_client_options() -> dict[str, str]:
-    """Pass an optional OpenAI-compatible base URL without changing OpenAI defaults."""
-    options = {"api_key": os.environ["OPENAI_API_KEY"]}
-    if base_url := os.environ.get("OPENAI_BASE_URL", "").strip():
-        options["base_url"] = base_url
-    return options
+class _OpenAIClientOptions(TypedDict):
+    api_key: str
+    base_url: str
+
+
+DEFAULT_READABLE_BASE_URL = "https://api.openai.com/v1"
+_AUTHORITY = re.compile(r"(?:\[[0-9a-fA-F:.]+\]|[^:\[\]]+)(?::[0-9]+)?\Z")
+_DNS_LABEL = re.compile(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\Z")
+
+
+class ReadableConfigError(RuntimeError, ValueError):
+    """A local configuration error with no input values in its diagnostic."""
+
+
+@dataclass(frozen=True)
+class ReadableReadiness:
+    ready: bool
+    host: str | None
+    diagnostic: str | None = None
+
+
+def _endpoint(value: str) -> tuple[str, str, bool]:
+    """Return the URL, display authority, and whether the host is a literal loopback."""
+    invalid = "OPENAI_BASE_URL must be an HTTP(S) API URL without credentials, query, or fragment."
+    url = value.strip()
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url) or any(
+        ch in url for ch in "\\?#"
+    ):
+        raise ReadableConfigError(invalid)
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port
+        if (
+            parsed.scheme not in ("http", "https")
+            or not host
+            or "@" in parsed.netloc
+            or not _AUTHORITY.fullmatch(parsed.netloc)
+            or port == 0
+        ):
+            raise ValueError
+        try:
+            address = ip_address(host)
+        except ValueError:
+            address = None
+            ascii_host = host.encode("idna").decode("ascii")
+            domain = ascii_host.removesuffix(".")
+            if len(domain) > 253 or not all(_DNS_LABEL.fullmatch(p) for p in domain.split(".")):
+                raise ValueError from None
+    except ValueError:
+        raise ReadableConfigError(invalid) from None
+    loopback = bool(address and address.is_loopback and not getattr(address, "ipv4_mapped", None))
+    if parsed.scheme == "http" and not loopback:
+        raise ReadableConfigError("OPENAI_BASE_URL requires HTTPS except for literal loopback IPs.")
+    authority = f"[{host}]" if ":" in host else host
+    if port is not None:
+        authority += f":{port}"
+    return url, authority, loopback
+
+
+def validate_readable_base_url(value: str) -> str:
+    """Validate an explicit endpoint for client configuration or the auth setter."""
+    return _endpoint(value)[0]
+
+
+def _configured_endpoint() -> tuple[str, str, bool]:
+    value = os.environ.get("OPENAI_BASE_URL", "")
+    if not value.strip() and os.environ.get(OPENAI_ENV_CONFLICT) == "endpoint":
+        raise ReadableConfigError(
+            "OPENAI_BASE_URL from .env cannot be combined with an OPENAI_API_KEY from the "
+            "environment for another origin. Set both in the environment or unset the shell key "
+            "and configure them in the same .env."
+        )
+    return _endpoint(value if value.strip() else DEFAULT_READABLE_BASE_URL)
+
+
+def _configured_key(loopback: bool) -> str:
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not key and not loopback:
+        if os.environ.get(OPENAI_ENV_CONFLICT) == "key":
+            raise ReadableConfigError(
+                "OPENAI_API_KEY from .env is configured for another origin than OPENAI_BASE_URL "
+                "in the environment. Set both in the environment or configure both in .env."
+            )
+        raise ReadableConfigError(
+            "OPENAI_API_KEY is required for a non-loopback readable endpoint."
+        )
+    if any(not 33 <= ord(character) <= 126 for character in key):
+        raise ReadableConfigError("OPENAI_API_KEY must contain only visible ASCII characters.")
+    return key
+
+
+def openai_client_options() -> _OpenAIClientOptions:
+    """Pass an explicit endpoint so the SDK cannot re-read a blank environment value."""
+    url, _, loopback = _configured_endpoint()
+    return _OpenAIClientOptions(api_key=_configured_key(loopback), base_url=url)
+
+
+def readable_readiness() -> ReadableReadiness:
+    """Inspect effective settings without creating an API client or exposing secrets."""
+    host = None
+    try:
+        _, host, loopback = _configured_endpoint()
+        _configured_key(loopback)
+        _ReadableSettings.from_env()
+    except ReadableConfigError as exc:
+        return ReadableReadiness(False, host, str(exc))
+    return ReadableReadiness(True, host)
 
 
 #: Reasoning effort for the fusion request. "none" omits the field entirely, which is
@@ -122,13 +241,9 @@ READABLE_REASONING_ENV = "TRANSCRIBE_READABLE_REASONING"
 READABLE_REASONING_LEVELS = ("none", "low", "medium", "high")
 
 
-def readable_reasoning() -> dict[str, str] | None:
-    level = os.environ.get(READABLE_REASONING_ENV, "medium").strip().lower() or "medium"
-    if level not in READABLE_REASONING_LEVELS:
-        raise ValueError(
-            f"{READABLE_REASONING_ENV}={level!r} is not supported, allowed values: "
-            + ", ".join(READABLE_REASONING_LEVELS)
-        )
+def readable_reasoning(api: str = "responses") -> dict[str, str] | None:
+    default = "medium" if api == "responses" else "none"
+    level = _env_choice(READABLE_REASONING_ENV, default, READABLE_REASONING_LEVELS)
     if level == "none":
         return None
     return {"effort": level}
@@ -148,8 +263,343 @@ def _is_digit_token(word: str) -> bool:
     return bool(_DIGIT_TOKEN.match(word))
 
 
-def _protected(text: str) -> list[str]:
-    return re.findall(r"\b\d+(?:[.,]\d+)?\b|https?://\S+|[\w.+-]+@[\w.-]+", text)
+_LINK_OR_EMAIL = r"https?://[^\s<>]+|[\w.+-]+@[\w.-]+"
+_SEMANTIC_WORD = re.compile(
+    rf"{_LINK_OR_EMAIL}|(?:[+−-]\s*|[$€£₽]\s*)*(?=\d)\d+"
+    r"(?:(?<=\d)[.,:/–−-]\d+|[-’']\w+|\w+)*(?:\s*[%‰$€£₽])?|\w+(?:[-’']\w+)*",
+    re.IGNORECASE,
+)
+_PLAIN_NUMBER = re.compile(r"(?P<value>[0-9]+)(?:-(?P<ending>[а-я]+)|(?P<en>st|nd|rd|th))?\Z")
+_NEGATIONS = frozenset(
+    [
+        "не",
+        "ни",
+        "нет",
+        "неть",
+        "нельзя",
+        "без",
+        "никак",
+        "нигде",
+        "ничто",
+        "ничего",
+        "никто",
+        "никого",
+        "никогда",
+        "никакой",
+        "not",
+        "no",
+        "never",
+        "neither",
+        "nor",
+        "none",
+        "nothing",
+        "nobody",
+        "nowhere",
+        "without",
+        "cannot",
+    ]
+)
+
+# A conservative grammar, not a general text-to-number converter. Unknown/ambiguous
+# phrases are kept verbatim. The tuple marks English/Russian, place and ordinal ending.
+_RU_NUMBER_FORMS = {
+    0: "ноль нуль ноля нуля",
+    1: "один одна одно одни одного одной одним одну",
+    2: "два две двух двум двумя",
+    3: "три трех трем тремя",
+    4: "четыре четырех четырем четырьмя",
+    5: "пять пяти пятью",
+    6: "шесть шести шестью",
+    7: "семь семи семью",
+    8: "восемь восьми восемью восьмью",
+    9: "девять девяти девятью",
+    10: "десять десяти десятью",
+    11: "одиннадцать одиннадцати одиннадцатью",
+    12: "двенадцать двенадцати двенадцатью",
+    13: "тринадцать тринадцати тринадцатью",
+    14: "четырнадцать четырнадцати четырнадцатью",
+    15: "пятнадцать пятнадцати пятнадцатью",
+    16: "шестнадцать шестнадцати шестнадцатью",
+    17: "семнадцать семнадцати семнадцатью",
+    18: "восемнадцать восемнадцати восемнадцатью",
+    19: "девятнадцать девятнадцати девятнадцатью",
+    20: "двадцать двадцати двадцатью",
+    30: "тридцать тридцати тридцатью",
+    40: "сорок сорока",
+    50: "пятьдесят пятидесяти пятьюдесятью",
+    60: "шестьдесят шестидесяти шестьюдесятью",
+    70: "семьдесят семидесяти семьюдесятью",
+    80: "восемьдесят восьмидесяти восемьюдесятью",
+    90: "девяносто девяноста",
+    100: "сто ста",
+    200: "двести двухсот",
+    300: "триста трехсот",
+    400: "четыреста четырехсот",
+    500: "пятьсот пятисот",
+    600: "шестьсот шестисот",
+    700: "семьсот семисот",
+    800: "восемьсот восьмисот",
+    900: "девятьсот девятисот",
+    1000: "тысяча тысячи тысяч тысячу тысячей",
+}
+_ORDINAL_STEMS = {
+    "перв": 1,
+    "втор": 2,
+    "четверт": 4,
+    "пят": 5,
+    "шест": 6,
+    "седьм": 7,
+    "восьм": 8,
+    "девят": 9,
+    "десят": 10,
+    "одиннадцат": 11,
+    "двенадцат": 12,
+    "тринадцат": 13,
+    "четырнадцат": 14,
+    "пятнадцат": 15,
+    "шестнадцат": 16,
+    "семнадцат": 17,
+    "восемнадцат": 18,
+    "девятнадцат": 19,
+    "двадцат": 20,
+    "тридцат": 30,
+    "сороков": 40,
+    "пятидесят": 50,
+    "шестидесят": 60,
+    "семидесят": 70,
+    "восьмидесят": 80,
+    "девяност": 90,
+    "сот": 100,
+}
+_ORDINAL_ENDINGS = {
+    "ый": "й",
+    "ой": "й",
+    "ая": "я",
+    "ое": "е",
+    "ые": "е",
+    "ого": "го",
+    "ому": "му",
+    "ым": "м",
+    "ом": "м",
+    "ую": "ю",
+    "ых": "х",
+    "ыми": "ми",
+}
+_RU_CARDINALS = {word: value for value, forms in _RU_NUMBER_FORMS.items() for word in forms.split()}
+_RU_ORDINALS = {
+    stem + ending: (value, suffix)
+    for stem, value in _ORDINAL_STEMS.items()
+    for ending, suffix in _ORDINAL_ENDINGS.items()
+} | {"третий": (3, "й"), "третьего": (3, "го"), "третья": (3, "я")}
+_EN_CARDINALS = dict(
+    zip(
+        [
+            "zero",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+            "eleven",
+            "twelve",
+            "thirteen",
+            "fourteen",
+            "fifteen",
+            "sixteen",
+            "seventeen",
+            "eighteen",
+            "nineteen",
+            "twenty",
+            "thirty",
+            "forty",
+            "fifty",
+            "sixty",
+            "seventy",
+            "eighty",
+            "ninety",
+            "hundred",
+            "thousand",
+        ],
+        [*range(20), *range(20, 100, 10), 100, 1000],
+        strict=True,
+    )
+)
+
+
+def _protected_links(text: str) -> list[str]:
+    return [link.rstrip(".,!?;:»”)") for link in re.findall(_LINK_OR_EMAIL, text, re.IGNORECASE)]
+
+
+_AMBIGUOUS_NUMBER_WORDS = frozenset(
+    [
+        "миллион",
+        "миллиона",
+        "миллионов",
+        "миллиону",
+        "миллионом",
+        "миллионе",
+        "миллионы",
+        "миллиард",
+        "миллиарда",
+        "миллиардов",
+        "миллиарду",
+        "миллиардом",
+        "миллиарде",
+        "миллиарды",
+        "триллион",
+        "триллиона",
+        "триллионов",
+        "триллионы",
+        "полтора",
+        "полторы",
+        "полтораста",
+        "половина",
+        "million",
+        "millions",
+        "billion",
+        "billions",
+        "trillion",
+        "trillions",
+        "half",
+        "quarter",
+    ]
+)
+
+
+def _number_word(word: str) -> tuple[str, int, str] | None:
+    if word in _RU_CARDINALS:
+        return "ru", _RU_CARDINALS[word], ""
+    if word in _RU_ORDINALS:
+        value, ending = _RU_ORDINALS[word]
+        return "ru", value, ending
+    if word in _EN_CARDINALS:
+        return "en", _EN_CARDINALS[word], ""
+    if word in _AMBIGUOUS_NUMBER_WORDS:
+        return "", -1, ""
+    return None
+
+
+def _spelled_integer(parts: list[tuple[str, int, str]]) -> tuple[int, str] | None:
+    lang = parts[0][0]
+    if not lang or any(part[0] != lang for part in parts) or any(part[2] for part in parts[:-1]):
+        return None
+    values = [part[1] for part in parts]
+    total = 0
+    if 1000 in values:
+        index = values.index(1000)
+        if index > 1 or (index and not 1 <= values[0] <= 9):
+            return None
+        total = (values[0] if index else 1) * 1000
+        values = values[index + 1 :]
+    if lang == "en" and len(values) >= 2 and 1 <= values[0] <= 9 and values[1] == 100:
+        total += values[0] * 100
+        values = values[2:]
+    elif values and 100 <= values[0] <= 900:
+        if lang == "en":
+            return None
+        total += values.pop(0)
+    if len(values) == 2 and 20 <= values[0] <= 90 and 1 <= values[1] <= 9:
+        total += sum(values)
+    elif len(values) == 1 and values[0] < 100 and (values[0] or not total):
+        total += values[0]
+    elif values:
+        return None
+    return total, parts[-1][2]
+
+
+@dataclass(frozen=True)
+class _NumberSpan:
+    tokens: tuple[str, ...]
+    value: tuple[int, str] | None = None
+    # Only spelled values can be reformatted; numeric identifiers, signs, suffixes,
+    # currency and range punctuation must be preserved literally.
+    spelled: bool = False
+
+
+def _semantic_tokens(text: str) -> list[str | _NumberSpan]:
+    tokens: list[str | _NumberSpan] = []
+    matches = list(_SEMANTIC_WORD.finditer(text.lower().replace("ё", "е").replace("’", "'")))
+    index = 0
+    while index < len(matches):
+        match = matches[index]
+        word = match[0]
+        if re.match(_LINK_OR_EMAIL, word, flags=re.IGNORECASE):
+            tokens.append(word)
+        elif any(character.isnumeric() for character in word):
+            number = _PLAIN_NUMBER.fullmatch(word)
+            value = None
+            if number and len(number["value"]) <= 4:
+                value = int(number["value"]), number["ending"] or number["en"] or ""
+            tokens.append(_NumberSpan((word,), value))
+        elif all(_number_word(part) for part in word.split("-")):
+            words = [word]
+            while index + 1 < len(matches):
+                next_ = matches[index + 1]
+                gap = text[matches[index].end() : next_.start()]
+                if not gap.isspace() or not all(_number_word(p) for p in next_[0].split("-")):
+                    break
+                index += 1
+                words.append(next_[0])
+            parts = [part for w in words for p in w.split("-") if (part := _number_word(p))]
+            value = _spelled_integer(parts)
+            # Preserve the prompt's explicit exceptions and ambiguous singular uses.
+            if index + 1 < len(matches) and matches[index + 1][0] in {"словах", "мой", "моя"}:
+                value = None
+            if len(words) == 1 and words[0] in {"один", "одна", "одно", "one"}:
+                value = None
+            if (
+                value
+                and value[1] == "й"
+                and index + 1 < len(matches)
+                and matches[index + 1][0] == "год"
+            ):
+                value = value[0], ""
+            tokens.append(_NumberSpan(tuple(words), value, spelled=True))
+        else:
+            tokens.append(word)
+        index += 1
+    return tokens
+
+
+def _matching_number(source: _NumberSpan, output: _NumberSpan) -> bool:
+    return source.tokens == output.tokens or (
+        source.spelled
+        and not output.spelled
+        and source.value is not None
+        and source.value == output.value
+    )
+
+
+def _numeric_context(tokens: list[str | _NumberSpan]) -> list[tuple[Any, ...]]:
+    # Keep values attached to the same neighboring words (e.g. quantities and units).
+    return [
+        tuple(part if isinstance(part, str) else None for part in tokens[max(0, i - 1) : i + 2])
+        for i, token in enumerate(tokens)
+        if isinstance(token, _NumberSpan)
+    ]
+
+
+def _negation_context(tokens: list[str | _NumberSpan]) -> list[tuple[Any, ...]]:
+    def comparable(token: str | _NumberSpan) -> Any:
+        if isinstance(token, _NumberSpan):
+            return token.value if token.value is not None else token.tokens
+        return token
+
+    return [
+        (
+            *(comparable(t) for t in tokens[max(0, i - 2) : i]),
+            None,
+            *(comparable(t) for t in tokens[i : i + 3]),
+        )
+        for i, token in enumerate(tokens)
+        if isinstance(token, str)
+        and any(part in _NEGATIONS or part.endswith("n't") for part in token.split("-"))
+    ]
 
 
 def _normalize_word(token: str) -> str:
@@ -227,11 +677,7 @@ def _is_allowed_word(word: str, allowed: set[str]) -> bool:
     """
     if word in allowed:
         return True
-    if _is_digit_token(word):
-        # Rule 4A's exception to word membership: a digitized number is a spelling
-        # choice, not new content, whether or not the spelled-out words happen to
-        # also be present. Letters are never covered by this branch.
-        return True
+
     parts = [part for part in word.split("-") if part]
     if len(parts) > 1:
         if all(part in allowed for part in parts):
@@ -315,15 +761,62 @@ RISKY_CHANGE_KINDS = frozenset({"substitution", "loss"})
 #: guess at a substring of a sentence that may be reworded later.
 CONCERN_FALLBACK = "kept the local text"
 CONCERN_REPAIR = "repaired by closeness to the source word"
+CONCERN_REMOVAL = "removed source words"
+
+
+def _audit_tokens(text: str) -> list[str]:
+    return [word for token in text.split() if (word := _normalize_word(token))]
+
+
+def _removed_words(utterance: Utterance, text: str) -> list[str]:
+    """Audit short and repeated words; a substring does not account for a token."""
+    source = _audit_tokens(utterance.raw_text)
+    produced = _audit_tokens(text)
+    allowed = _word_set(_source_union(utterance))
+    heard = Counter(source)
+    for variant in utterance.variants.values():
+        if variant.strip():
+            heard &= Counter(_audit_tokens(variant))
+    # Alignment distinguishes a replacement from otherwise hidden deletions.
+    alignment = SequenceMatcher(None, source, produced, autojunk=False)
+    removed: list[str] = []
+    for kind, a, b, c, d in alignment.get_opcodes():
+        if kind not in ("replace", "delete"):
+            continue
+        prior, after = source[a:b], produced[c:d]
+        if after and "".join(prior).replace("-", "") == "".join(after).replace("-", ""):
+            continue  # a separator-only join or split
+        if after and _is_digit_token(after[0]):
+            before_number = _semantic_tokens(" ".join(prior))
+            after_number = _semantic_tokens(after[0])
+            if (
+                len(before_number) == len(after_number) == 1
+                and isinstance(x := before_number[0], _NumberSpan)
+                and isinstance(y := after_number[0], _NumberSpan)
+                and _matching_number(x, y)
+            ):
+                continue
+        if len(prior) == len(after) == 1 and not _is_allowed_word(after[0], allowed):
+            # An actual novel replacement is classified separately; an extra
+            # instance of an existing word must not hide an unrelated deletion.
+            continue
+        removed.extend(prior)
+    # Do not claim a loss if only one model heard it, or if the agreed count
+    # of the word is still present elsewhere in the output.
+    missing = heard - Counter(produced)
+    lost = []
+    for word in removed:
+        if missing[word] > 0:
+            lost.append(word)
+            missing[word] -= 1
+    return lost
 
 
 def classify_changes(utterance: Utterance) -> list[str]:
     """Classify every word the LLM changed in one utterance, without asking a model.
 
-    An LLM auditing an LLM would share its failure modes, so this is arithmetic over
-    two texts: edit distance for a repair, a Latin character for a transliteration,
-    set difference for a word that vanished. A Cyrillic term swapped for another
-    Cyrillic term lands in "substitution" on purpose — that is the case a human must read.
+    Use local edit distance, token alignment and counts; never ask the same model
+    to verify its own changes. Cyrillic substitutions stay flagged for review.
     """
     result = utterance.readable_text or ""
     if not result:
@@ -345,20 +838,7 @@ def classify_changes(utterance: Utterance) -> list[str]:
             kinds.append("repair")
         else:
             kinds.append("transliteration" if _LATIN.search(word) else "substitution")
-    # Only words every model heard count as lost; one model mishearing is not a loss.
-    heard = _word_set(utterance.raw_text)
-    for variant_text in utterance.variants.values():
-        heard &= _word_set(variant_text)
-    folded = result.lower().replace("ё", "е")
-    lost = [
-        word
-        for word in sorted(heard)
-        if len(word) >= 4 and word not in produced and word not in folded
-    ]
-    # Every replacement is physically a loss plus a gain: 'виспер' -> 'Whisper' would
-    # otherwise be reported twice, once as a phantom loss. Only the net remainder is
-    # a word that genuinely went missing, and netting needs no transliteration table.
-    return kinds + ["loss"] * max(0, len(lost) - len(kinds))
+    return kinds + ["loss"] * len(_removed_words(utterance, result))
 
 
 def validate_readable(
@@ -373,13 +853,9 @@ def validate_readable(
     drop every other utterance in the batch to its local text. Each of those is now a
     per-utterance fallback instead.
 
-    Protected values (digits, URLs, emails, glossary terms) are checked against the
-    canonical utterance (`raw_text`, payload field "a") only, not the union of every
-    variant: a number only Whisper heard is real content the model may legitimately
-    prefer over `a`, per rule 3, and requiring it verbatim in the output punished the
-    model for doing exactly what the prompt asks. Word membership stays checked
-    against the union of all variants — a word the model kept from b or c, instead of
-    a, is an edit, not a fabrication, and rejecting it would contradict rule 3 too.
+    Numbers and negation must agree with the canonical utterance. A number can
+    change form only when the local grammar proves a lossless conversion. Word
+    membership for other edits continues to use the union of all variants.
     """
     expected = [u.utterance_id for u in utterances]
     ids = [item.get("utterance_id") for item in items]
@@ -396,14 +872,33 @@ def validate_readable(
             rejected[utterance.utterance_id] = ["the model returned empty text"]
             output[utterance.utterance_id] = utterance.light_text or utterance.raw_text
             continue
-        protected_values = _protected(utterance.raw_text) + [
-            term for term in protected_terms if term in utterance.raw_text
-        ]
-        missing = [value for value in protected_values if value not in text]
-        if missing:
-            rejected[utterance.utterance_id] = [
-                f"lost protected value {value!r}" for value in missing
-            ]
+        source = _semantic_tokens(utterance.raw_text)
+        edited = _semantic_tokens(text)
+        numbers = [t for t in source if isinstance(t, _NumberSpan)]
+        edited_numbers = [t for t in edited if isinstance(t, _NumberSpan)]
+        reason = None
+        if (
+            len(numbers) != len(edited_numbers)
+            or _numeric_context(source) != _numeric_context(edited)
+            or not all(_matching_number(a, b) for a, b in zip(numbers, edited_numbers, strict=True))
+        ):
+            reason = "changed numeric content"
+        elif _negation_context(source) != _negation_context(edited):
+            reason = "changed negation or its immediate context"
+        if not reason and _protected_links(utterance.raw_text) != _protected_links(text):
+            reason = "changed a protected link or email address"
+        if not reason and any(
+            term in utterance.raw_text and term not in text for term in protected_terms
+        ):
+            reason = "lost a protected glossary term"
+        if not reason and source:
+            if not any(ch.isalnum() for ch in text):
+                reason = "the model returned no spoken text"
+            elif len(edited) * 2 < len(source) and len(source) - len(edited) >= 3:
+                # Compare semantic tokens so normal number formatting is not a loss.
+                reason = "the model dropped most of the source words"
+        if reason:
+            rejected[utterance.utterance_id] = [reason]
             output[utterance.utterance_id] = utterance.light_text or utterance.raw_text
             continue
         # Word membership degrades per utterance instead of raising: one over-eager
@@ -417,13 +912,14 @@ def validate_readable(
         tokens = [word for token in text.split() if (word := _normalize_word(token))]
         changed: list[str] = []
         for word in tokens:
-            if _is_allowed_word(word, allowed_words):
+            # Digit tokens have already passed the ordered, exact semantic check.
+            if _is_digit_token(word) or _is_allowed_word(word, allowed_words):
                 continue
             source_word = _repaired_from(word, allowed_words)
             changed.append(f"{source_word} → {word}" if source_word else f"+{word}")
         if len(changed) > max(2, round(len(tokens) * _MAX_CHANGED_SHARE)):
             # Not an edit any more: too much of the utterance is not in either source.
-            rejected[utterance.utterance_id] = [f"words outside the variants: {', '.join(changed)}"]
+            rejected[utterance.utterance_id] = ["too many words outside the ASR variants"]
             output[utterance.utterance_id] = utterance.light_text or utterance.raw_text
             continue
         if changed:
@@ -435,6 +931,53 @@ def validate_readable(
 #: Utterances per LLM request. A whole two-hour meeting in one call risks hitting the
 #: output limit and truncating, which fails the id check and wastes the entire pass.
 READABLE_BATCH_SIZE = 150
+READABLE_API_ENV = "TRANSCRIBE_READABLE_API"
+READABLE_RESPONSE_FORMAT_ENV = "TRANSCRIBE_READABLE_RESPONSE_FORMAT"
+READABLE_BATCH_SIZE_ENV = "TRANSCRIBE_READABLE_BATCH_SIZE"
+READABLE_REQUEST_TIMEOUT = 120.0
+
+
+def _env_choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    value = os.environ.get(name, "").strip().lower() or default
+    if value not in allowed:
+        raise ReadableConfigError(f"{name} must be one of: {', '.join(allowed)}")
+    return value
+
+
+@dataclass(frozen=True)
+class _ReadableSettings:
+    api: str
+    response_format: str
+    reasoning: dict[str, str] | None
+    batch_size: int
+
+    @classmethod
+    def from_env(cls) -> _ReadableSettings:
+        api = _env_choice(READABLE_API_ENV, "responses", ("responses", "chat"))
+        response_format = _env_choice(
+            READABLE_RESPONSE_FORMAT_ENV, "json_schema", ("json_schema", "json_object")
+        )
+        raw_size = os.environ.get(READABLE_BATCH_SIZE_ENV, "").strip()
+        try:
+            batch_size = int(raw_size) if raw_size else READABLE_BATCH_SIZE
+        except ValueError:
+            batch_size = 0
+        if batch_size < 1:
+            raise ReadableConfigError(f"{READABLE_BATCH_SIZE_ENV} must be a positive integer")
+        return cls(api, response_format, readable_reasoning(api), batch_size)
+
+
+@dataclass
+class _BatchResult:
+    texts: dict[str, str]
+    concerns: list[dict[str, str]]
+    fallback_utterances: int
+    repaired_utterances: int = 0
+
+
+def _add_usage(usage: dict[str, int], counts: dict[str, int]) -> None:
+    for key, value in counts.items():
+        usage[key] = usage.get(key, 0) + value
 
 
 def _fuse_batch(
@@ -444,68 +987,75 @@ def _fuse_batch(
     batch: list[Utterance],
     protected_terms: set[str],
     variant_models: Sequence[str] = (),
-) -> tuple[dict[str, str], list[dict[str, str]], dict[str, Any]]:
-    """Fuse one batch, retrying once. Raises ValueError if it still does not validate."""
-    import json
-
-    from .schemas import ReadablePayload
-
+    *,
+    usage: dict[str, int],
+    settings: _ReadableSettings | None = None,
+) -> _BatchResult:
+    """Fuse one batch, retrying JSON schema or utterance ID validation once."""
     retry_note = ""
-    last_error: Exception | None = None
-    reasoning = readable_reasoning()
+    settings = settings or _ReadableSettings.from_env()
+    payload = json.dumps(build_payload(batch, variant_models), ensure_ascii=False)
     for attempt in range(2):
-        request_kwargs: dict[str, Any] = {
-            "model": model,
-            "store": False,
-            "input": [
-                {"role": "system", "content": instructions + retry_note},
-                {
-                    "role": "user",
-                    "content": json.dumps(build_payload(batch, variant_models), ensure_ascii=False),
-                },
-            ],
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "readable_transcript",
-                    "strict": True,
-                    "schema": ReadablePayload.model_json_schema(),
-                }
-            },
-        }
-        if reasoning is not None:
-            request_kwargs["reasoning"] = reasoning
-        response = client.responses.create(**request_kwargs)
         try:
-            parsed = ReadablePayload.model_validate_json(response.output_text)
+            output, counts = request_readable(
+                client,
+                settings.api,
+                settings.response_format,
+                model,
+                instructions + retry_note,
+                payload,
+                settings.reasoning,
+            )
+        except UnusableReply as exc:
+            _add_usage(usage, exc.usage or {})
+            raise
+        _add_usage(usage, counts)
+        try:
+            parsed = ReadablePayload.model_validate_json(output)
             texts, rejected, repairs = validate_readable(
                 batch, [item.model_dump() for item in parsed.items], protected_terms
             )
-        except (ValueError, json.JSONDecodeError) as exc:
-            last_error = exc
+        except ValueError:
             if attempt:
                 break
             retry_note = (
-                f" The previous response failed local validation: {exc}. "
-                "Fix only the format and keep all the constraints."
+                "\nThe previous response failed local validation. Return valid JSON matching "
+                "the schema, with each original utterance ID exactly once and in input order."
             )
             continue
         concerns = [
-            {"utterance_id": item.utterance_id, "note": concern}
+            {"utterance_id": item.utterance_id, "note": "the model flagged uncertainty"}
             for item in parsed.items
-            for concern in item.concerns
+            if any(concern.strip() for concern in item.concerns)
         ]
-        concerns.extend(
-            {"utterance_id": utterance_id, "note": f"{CONCERN_REPAIR}: " + ", ".join(fixes)}
-            for utterance_id, fixes in repairs.items()
-        )
+        repaired_count = 0
+        for uid, changes in repairs.items():
+            additions = [change for change in changes if change.startswith("+")]
+            corrections = [change for change in changes if not change.startswith("+")]
+            if corrections:
+                repaired_count += 1
+                concerns.append(
+                    {"utterance_id": uid, "note": f"{CONCERN_REPAIR}: " + ", ".join(corrections)}
+                )
+            if additions:
+                concerns.append(
+                    {
+                        "utterance_id": uid,
+                        "note": "words outside the variants: " + ", ".join(additions),
+                    }
+                )
         concerns.extend(
             {"utterance_id": uid, "note": f"{CONCERN_FALLBACK}: {'; '.join(reasons)}"}
             for uid, reasons in rejected.items()
         )
-        usage = response.usage.model_dump() if getattr(response, "usage", None) else {}
-        return texts, concerns, usage
-    raise ValueError(str(last_error))
+        for utterance in batch:
+            uid = utterance.utterance_id
+            if uid not in rejected and (removed := _removed_words(utterance, texts[uid])):
+                concerns.append(
+                    {"utterance_id": uid, "note": f"{CONCERN_REMOVAL}: {', '.join(removed)}"}
+                )
+        return _BatchResult(texts, concerns, len(rejected), repaired_count)
+    raise UnusableReply("the response failed local JSON schema or utterance ID validation")
 
 
 def clean_readable(
@@ -516,14 +1066,11 @@ def clean_readable(
     status: Callable[[str], None] | None = None,
     variant_models: Sequence[str] = (),
 ) -> ReadableResult:
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError(
-            "readable expects OPENAI_API_KEY in the environment; raw and light are already "
-            "ready locally."
-        )
-    from openai import OpenAI  # lazy; no audio is provided to this client
+    if not utterances:
+        raise ReadableConfigError("readable has no utterances to clean; no request was sent.")
+    options = openai_client_options()
+    settings = _ReadableSettings.from_env()
 
-    client = OpenAI(**openai_client_options())
     instructions = READABLE_FUSION_INSTRUCTIONS
     if context_prompt.strip():
         # Rule 3 now invites the model to use this context, so the boundary has to be
@@ -533,25 +1080,107 @@ def clean_readable(
             "слово, которого нет ни в одном из них, и не является источником фактов для "
             f"транскрипта: {context_prompt.strip()}"
         )
+    from httpx import InvalidURL
+    from openai import DefaultHttpxClient, OpenAI
+
+    custom_endpoint = options["base_url"].rstrip("/") != DEFAULT_READABLE_BASE_URL
+
+    def remove_provider_headers(request: Any) -> None:
+        request.headers.pop("OpenAI-Organization", None)
+        request.headers.pop("OpenAI-Project", None)
+
+    hooks = {"request": [remove_provider_headers]} if custom_endpoint else None
+    with DefaultHttpxClient(
+        follow_redirects=False, trust_env=False, event_hooks=hooks
+    ) as http_client:
+        try:
+            # No automatic transport retries: the server may have processed/charged
+            # a request even when the client gets a timeout or sees a gateway error.
+            client = OpenAI(
+                **options,
+                http_client=http_client,
+                timeout=READABLE_REQUEST_TIMEOUT,
+                max_retries=0,
+            )
+        except InvalidURL:
+            raise ReadableConfigError("OPENAI_BASE_URL is not a valid API URL.") from None
+        result = _clean_batches(
+            client,
+            utterances,
+            model,
+            protected_terms,
+            instructions,
+            status,
+            variant_models,
+            settings,
+        )
+    if custom_endpoint:
+        result.provider = "openai-compatible"
+    return result
+
+
+def _clean_batches(
+    client: Any,
+    utterances: list[Utterance],
+    model: str,
+    protected_terms: set[str],
+    instructions: str,
+    status: Callable[[str], None] | None,
+    variant_models: Sequence[str],
+    settings: _ReadableSettings,
+) -> ReadableResult:
+    batch_size = settings.batch_size
     batches = [
-        utterances[start : start + READABLE_BATCH_SIZE]
-        for start in range(0, len(utterances), READABLE_BATCH_SIZE)
+        utterances[start : start + batch_size] for start in range(0, len(utterances), batch_size)
     ]
     texts: dict[str, str] = {}
     concerns: list[dict[str, str]] = []
-    usage: dict[str, Any] = {}
-    failed = 0
+    usage: dict[str, int] = {}
+    accepted = 0
+    repaired = 0
+    endpoint_failure = None
+    pending_ids: list[str] = []
+    validated_batches = 0
+    last_failure = ""
     for number, batch in enumerate(batches, 1):
         if status:
             status(f"readable: batch {number}/{len(batches)} ({len(batch)} utterances)")
         try:
-            batch_texts, batch_concerns, batch_usage = _fuse_batch(
-                client, model, instructions, batch, protected_terms, variant_models
+            result = _fuse_batch(
+                client,
+                model,
+                instructions,
+                batch,
+                protected_terms,
+                variant_models,
+                usage=usage,
+                settings=settings,
             )
-        except ValueError as exc:
+        except EndpointError as exc:
+            if not accepted:
+                raise
+            # An endpoint failure is not a malformed batch. Keep prior edits, but do
+            # not resend more transcript text to an unreachable/refusing endpoint.
+            remaining = utterances[(number - 1) * batch_size :]
+            endpoint_failure = str(exc)
+            pending_ids.extend(item.utterance_id for item in remaining)
+            texts.update(
+                {item.utterance_id: item.light_text or item.raw_text for item in remaining}
+            )
+            concerns.append(
+                {
+                    "utterance_id": batch[0].utterance_id,
+                    "note": f"{exc}; kept the remaining local text",
+                }
+            )
+            if status:
+                status(f"{exc}; kept the remaining local text")
+            break
+        except UnusableReply as exc:
             # One bad batch must not discard the rest: its utterances keep the local
             # text, exactly as a rejected word does inside a batch.
-            failed += 1
+            last_failure = str(exc)
+            pending_ids.extend(item.utterance_id for item in batch)
             texts.update({item.utterance_id: item.light_text or item.raw_text for item in batch})
             concerns.append(
                 {
@@ -562,12 +1191,28 @@ def clean_readable(
             if status:
                 status(f"readable: batch {number} failed validation, kept the local text")
             continue
-        texts.update(batch_texts)
-        concerns.extend(batch_concerns)
-        for key, value in batch_usage.items():
-            if isinstance(value, int):
-                usage[key] = usage.get(key, 0) + value
-    if failed == len(batches):
-        # Nothing was gained anywhere: report it as a failure, not a silent no-op.
-        raise RuntimeError("readable failed validation in every batch; raw/light are unchanged.")
-    return ReadableResult(texts, concerns, usage)
+        texts.update(result.texts)
+        concerns.extend(result.concerns)
+        validated_batches += 1
+        accepted += len(batch) - result.fallback_utterances
+        repaired += result.repaired_utterances
+    if not accepted:
+        if not validated_batches:
+            raise UnusableReply(
+                f"readable failed validation in every batch ({last_failure}); raw/light are unchanged."
+            )
+        raise UnusableReply(
+            "readable: no utterances passed local content validation; raw/light are unchanged."
+        )
+    return ReadableResult(
+        texts,
+        concerns,
+        usage,
+        accepted_utterances=accepted,
+        fallback_utterances=len(utterances) - accepted,
+        api=settings.api,
+        response_format=settings.response_format,
+        repaired_utterances=repaired,
+        endpoint_failure=endpoint_failure,
+        pending_utterance_ids=pending_ids or None,
+    )

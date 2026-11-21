@@ -1,0 +1,9 @@
+include CHANGELOG.md CONTRIBUTING.md uv.lock
+recursive-include docs *.md
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include tests/fixtures *.json
+
+prune .hermes
+global-exclude .env .env.*
+include .env.example

@@ -97,18 +97,57 @@ def overlap_seconds(start: float, end: float, segment: tuple[float, float, str])
 
 
 def assign_words(words: list[Word], exclusive: list[tuple[float, float, str]]) -> list[Word]:
+    if not exclusive or not words:
+        return words
+    # Index turns by start with the maximum end of each subtree. This prunes
+    # non-overlapping branches without assuming turns or words are disjoint.
+    turns = sorted(enumerate(exclusive), key=lambda turn: turn[1][0])
+    max_ends = [0.0] * len(turns)
+
+    def index_ends(lo: int, hi: int) -> float:
+        if lo == hi:
+            return float("-inf")
+        mid = (lo + hi) // 2
+        max_ends[mid] = max(turns[mid][1][1], index_ends(lo, mid), index_ends(mid + 1, hi))
+        return max_ends[mid]
+
+    def candidates(lo: int, hi: int, start: float, end: float):
+        if lo == hi:
+            return
+        mid = (lo + hi) // 2
+        if max_ends[mid] <= start or turns[lo][1][0] >= end:
+            return
+        idx, item = turns[mid]
+        if item[0] < end and item[1] > start:
+            yield idx, item
+        yield from candidates(lo, mid, start, end)
+        yield from candidates(mid + 1, hi, start, end)
+
+    index_ends(0, len(turns))
+    # For the fallback, nearest to either boundary; preserve original turn order
+    # for ties, including equal timestamps that belong to different speakers.
+    boundary_turn: dict[float, int] = {}
+    for index, (start, end, _) in enumerate(exclusive):
+        boundary_turn.setdefault(start, index)
+        boundary_turn.setdefault(end, index)
+    boundaries = sorted(boundary_turn)
     for word in words:
-        scored = [(overlap_seconds(word.start, word.end, item), item) for item in exclusive]
-        score, item = max(scored, default=(0.0, None), key=lambda pair: pair[0])
-        if score and item:
-            word.speaker_id = item[2]
+        scored = (
+            (overlap_seconds(word.start, word.end, item), -index)
+            for index, item in candidates(0, len(turns), word.start, word.end)
+        )
+        score, neg_index = max(scored, default=(0.0, 0))
+        if score > 0:
+            word.speaker_id = exclusive[-neg_index][2]
             continue
         midpoint = (word.start + word.end) / 2
-        nearby = min(
-            exclusive, default=None, key=lambda x: min(abs(midpoint - x[0]), abs(midpoint - x[1]))
+        position = bisect.bisect_left(boundaries, midpoint)
+        distance, index = min(
+            (abs(midpoint - point), boundary_turn[point])
+            for point in boundaries[max(0, position - 1) : position + 1]
         )
-        if nearby and min(abs(midpoint - nearby[0]), abs(midpoint - nearby[1])) <= 1.5:
-            word.speaker_id = nearby[2]
+        if distance <= 1.5:
+            word.speaker_id = exclusive[index][2]
     return words
 
 
@@ -134,14 +173,16 @@ def make_utterances(
     for index, group in enumerate(groups, 1):
         text = "".join(word.text for word in group).strip()
         probabilities = [word.probability for word in group if word.probability is not None]
+        start = min(word.start for word in group)
+        end = max(word.end for word in group)
         output.append(
             Utterance(
                 utterance_id=f"{prefix}-u{index:05d}",
                 source_file=source_file,
-                source_start=group[0].start,
-                source_end=group[-1].end,
-                meeting_start=source_offset + group[0].start,
-                meeting_end=source_offset + group[-1].end,
+                source_start=start,
+                source_end=end,
+                meeting_start=source_offset + start,
+                meeting_end=source_offset + end,
                 speaker_id=group[0].speaker_id,
                 speaker_name=speaker_names.get(group[0].speaker_id, group[0].speaker_id),
                 raw_text=text,

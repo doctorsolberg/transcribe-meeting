@@ -11,14 +11,15 @@ that reach through `core.` need no changes.
 from __future__ import annotations
 
 import csv
+import io
 from pathlib import Path
 
 import yaml
 
 from .cleaning import light_clean
-from .job import load_utterances, save_canonical
+from .job import load_utterances
 from .readable import RISKY_CHANGE_KINDS, classify_changes
-from .result import write_job_result
+from .readable_publish import job_transaction
 from .util import atomic_text, fmt_time, read_json
 
 CHANGE_COLUMNS = [
@@ -65,11 +66,11 @@ def write_readable_changes(job: Path) -> tuple[Path, dict[str, int]]:
     # Risky rows first so the file opens on what actually needs a human.
     rows.sort(key=lambda row: (row["needs_attention"] != "yes", row["utterance_id"]))
     target = job / "review" / "readable_changes.csv"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", encoding="utf-8", newline="") as handle:
+    with io.StringIO(newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]) if rows else CHANGE_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
+        atomic_text(target, handle.getvalue())
     totals["utterances"] = len(rows)
     totals["needs_attention"] = sum(1 for row in rows if row["needs_attention"] == "yes")
     return target, totals
@@ -133,9 +134,12 @@ def prepare_review(job: Path) -> Path:
 
 
 def refine(job: Path, review_csv: Path) -> None:
-    # Deferred: core imports write_readable_changes/prepare_review/refine from this
-    # module, so a module-level `from .core import render_all` would be circular.
-    from .core import render_all
+    with job_transaction(job):
+        _refine(job, review_csv)
+
+
+def _refine(job: Path, review_csv: Path) -> None:
+    from .core import save_transcript_edit  # core imports the review commands
 
     text_replacements: dict[str, str] = {}
     speaker_replacements: dict[str, str] = {}
@@ -157,18 +161,27 @@ def refine(job: Path, review_csv: Path) -> None:
     # to attach an unknown name to.
     name_to_id = {name: identifier for identifier, name in known_names.items()}
     utterances = load_utterances(job)
+    edited_text = set()
     for item in utterances:
         if item.utterance_id in text_replacements:
+            edited_text.add(item.utterance_id)
             item.raw_text = text_replacements[item.utterance_id]
             item.light_text = light_clean(item.raw_text)
+            if item.readable_text is not None:
+                item.readable_text = item.raw_text
         if item.utterance_id in speaker_replacements:
             new_name = speaker_replacements[item.utterance_id]
             item.speaker_name = new_name
             if new_name in name_to_id:
                 item.speaker_id = name_to_id[new_name]
-    canonical = read_json(job / "canonical.json")
-    save_canonical(job, read_json(job / "manifest.json"), utterances, canonical["diarization"])
-    render_all(job)
-    # refine rewrites utterance text and speakers, so the job summary must follow:
-    # a stale result.json would report counts that no longer match the transcripts.
-    write_job_result(job)
+    manifest = read_json(job / "manifest.json")
+    state = manifest.get("readable") or {}
+    if edited_text:
+        manifest["manual_text_edits"] = sorted(
+            set(manifest.get("manual_text_edits", [])) | edited_text
+        )
+        if "concerns" in state:
+            state["concerns"] = [
+                row for row in state["concerns"] if row.get("utterance_id") not in edited_text
+            ]
+    save_transcript_edit(job, manifest, utterances)

@@ -52,6 +52,8 @@ packages = ["transcribe_meeting"]
 dev = ["pytest>=8,<9", "pytest-cov>=5,<6", "ruff>=0.6,<1"]
 
 [tool.uv]
+# Supported installation is from source with `uv sync --locked`. This override
+# is not part of wheel metadata; building a wheel does not verify pip resolution.
 # diarize pins torch<2.9 and torchaudio<2.9, while pyannote.audio 4 and GigaAM need a
 # current torch. The API diarize actually uses (torchaudio.load,
 # torchaudio.compliance.kaldi) is present in the 2.11/2.13 branch already installed.

@@ -65,8 +65,11 @@ def _install_fake_wespeakerruntime(monkeypatch):
     root_module = types.ModuleType("wespeakerruntime")
     root_module.hub = hub_module
     root_module.Speaker = Speaker
+    speaker_module = types.ModuleType("wespeakerruntime.speaker")
+    vars(speaker_module)["torchaudio"] = types.SimpleNamespace()
     monkeypatch.setitem(sys.modules, "wespeakerruntime", root_module)
     monkeypatch.setitem(sys.modules, "wespeakerruntime.hub", hub_module)
+    monkeypatch.setitem(sys.modules, "wespeakerruntime.speaker", speaker_module)
     return Hub, Speaker
 
 

@@ -93,7 +93,12 @@ def _ready_models_dir(base: Path) -> Path:
     gigaam.mkdir(parents=True)
     (gigaam / "multilingual_large_ctc.ckpt").write_bytes(b"stub")
     (gigaam / "v3_rnnt.ckpt").write_bytes(b"stub")
-    (models / "huggingface").mkdir()
+    vad = models / "huggingface" / "models--pyannote--segmentation-3.0"
+    snapshot = vad / "snapshots" / "test-revision"
+    snapshot.mkdir(parents=True)
+    (snapshot / "pytorch_model.bin").write_bytes(b"stub")
+    (vad / "refs").mkdir()
+    (vad / "refs" / "main").write_text("test-revision", encoding="utf-8")
     wespeaker = models / "wespeaker" / "en"
     wespeaker.mkdir(parents=True)
     (wespeaker / "model.onnx").write_bytes(b"stub")
@@ -124,6 +129,59 @@ def test_doctor_without_models_reports_not_ready_with_advice_only_on_stderr():
     assert result.exit_code == 1
     assert "Traceback" not in plain(result.output)
     assert "setup" in result.stderr
+
+
+def test_setup_missing_data_root_reaches_huggingface_hint(monkeypatch):
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setattr("transcribe_meeting.cli.check_ffmpeg", lambda: None)
+    monkeypatch.setattr("transcribe_meeting.cli._free_space_bytes", lambda _: 8 * 1024**3)
+    result = runner.invoke(app, ["setup"])
+
+    assert result.exit_code == 2, result.output
+    assert "segmentation-3.0" in plain(result.stderr)
+    assert "speaker-diarization-community-1" not in plain(result.stderr)
+
+
+def test_setup_does_not_publish_a_lock_if_smoke_fails(monkeypatch, tmp_path):
+    from transcribe_meeting import provisioning
+
+    models = tmp_path / "model-cache"
+    models.mkdir()
+    lock = models / "models.lock.json"
+    original = b'{"models": {"old": {}}}'
+    lock.write_bytes(original)
+    monkeypatch.setenv("TRANSCRIBE_MODELS_DIR", str(models))
+    monkeypatch.setenv("HF_TOKEN", "test-placeholder")
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setattr("transcribe_meeting.cli.check_ffmpeg", lambda: None)
+    monkeypatch.setattr("transcribe_meeting.cli._free_space_bytes", lambda _: 8 * 1024**3)
+    monkeypatch.setattr(provisioning, "check_huggingface_access", lambda **kw: None)
+    vad = models / "vad"
+    vad.mkdir()
+    (vad / "pytorch_model.bin").write_bytes(b"fixture")
+    monkeypatch.setattr("huggingface_hub.snapshot_download", lambda *a, **kw: str(vad))
+    monkeypatch.setattr(provisioning, "download_gigaam_models", lambda *a, **kw: (models, {}))
+    monkeypatch.setattr(provisioning, "download_diarization_models", lambda **kw: ({}, None, None))
+
+    def fail_smoke(**kwargs):
+        raise RuntimeError("simulated offline model failure")
+
+    monkeypatch.setattr(provisioning, "run_smoke_tests", fail_smoke)
+    result = runner.invoke(app, ["setup"])
+
+    assert result.exit_code == 2, result.output
+    assert "simulated offline model failure" in plain(result.stderr)
+    assert lock.read_bytes() == original
+
+
+def test_doctor_rejects_empty_huggingface_cache(tmp_path):
+    models = _ready_models_dir(tmp_path)
+    cache = models / "huggingface" / "models--pyannote--segmentation-3.0"
+    (cache / "snapshots" / "test-revision" / "pytorch_model.bin").unlink()
+    result = runner.invoke(app, ["--models-dir", str(models), "doctor"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["vad_ready"] is False
 
 
 # --- 3. preflight rejections: each exits 2 with a message naming the fix -----------

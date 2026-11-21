@@ -3,9 +3,11 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager, suppress
 from pathlib import Path
+from threading import Lock, get_ident
 from typing import Any
 
-from .asr import deepgram_words, transcribe_deepgram
+from .asr import MIN_WORD_SECONDS, deepgram_speaker_label, deepgram_words, transcribe_deepgram
+from .audio import load_model_waveform
 from .util import atomic_json, atomic_text
 
 DIARIZATION_PROVIDERS = ("pyannote", "foxnose", "deepgram")
@@ -26,6 +28,21 @@ OVERLAP_MIN_SECONDS = 0.5
 # consecutive same-speaker words into one utterance — reused here so a Deepgram
 # diarization segment breaks on the same silence a canonical utterance would.
 DEEPGRAM_SEGMENT_GAP = 0.8
+_FOXNOSE_LOCK = Lock()
+COMMUNITY1_FILES = (
+    "config.yaml",
+    "segmentation/pytorch_model.bin",
+    "embedding/pytorch_model.bin",
+    "plda/plda.npz",
+    "plda/xvec_transform.npz",
+)
+
+
+def missing_community1_files(model_path: Path) -> list[Path]:
+    # Pipelines accept either the snapshot directory or the local config file itself.
+    config = model_path if model_path.is_file() else model_path / COMMUNITY1_FILES[0]
+    required = [config, *(config.parent / name for name in COMMUNITY1_FILES[1:])]
+    return [path for path in required if not path.is_file()]
 
 
 def _write_rttm(rttm: Path, rows: list[dict[str, Any]]) -> None:
@@ -55,6 +72,7 @@ def diarize(
     deepgram_api_key: str | None = None,
     deepgram_language: str | None = None,
     deepgram_checkpoint: Path | None = None,
+    deepgram_response: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if provider == "pyannote":
         return _diarize_pyannote(
@@ -72,6 +90,8 @@ def diarize(
         # speakers/minimum/maximum/cpu_threads are deliberately unused: Deepgram's API
         # takes no speaker-count parameter and runs on their servers,
         # not ours.
+        if deepgram_response is not None:
+            return _write_deepgram_diarization(deepgram_response, output, rttm)
         if not deepgram_api_key:
             raise RuntimeError("--diarization-provider deepgram needs DEEPGRAM_API_KEY.")
         if deepgram_checkpoint is None:
@@ -94,6 +114,13 @@ def _diarize_pyannote(
     maximum: int,
     cpu_threads: int,
 ) -> dict[str, Any]:
+    missing = missing_community1_files(model_path)
+    if missing:
+        raise RuntimeError(
+            f"Local pyannote model (Community-1) is missing {missing[0]}. Accept the terms on "
+            "Hugging Face, then run: "
+            "transcribe-meeting setup --diarization-provider pyannote"
+        )
     os.environ.update(
         {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "PYANNOTE_METRICS_ENABLED": "0"}
     )
@@ -104,15 +131,7 @@ def _diarize_pyannote(
         raise RuntimeError(
             "pyannote.audio is missing: run `uv run transcribe-meeting setup`."
         ) from exc
-    if not model_path.exists():
-        # Same defence-in-depth note as GigaAMBackend._load: `run` rejects this route
-        # in cli._check_route_ready before create_job, so reaching here means some
-        # other caller invoked diarization directly.
-        raise RuntimeError(
-            "Local pyannote model (Community-1) not found. Accept the terms on "
-            "Hugging Face, then run: "
-            "transcribe-meeting setup --diarization-provider pyannote"
-        )
+
     torch.set_num_threads(cpu_threads)
     # PyTorch only permits this setting before parallel work begins in a process.
     with suppress(RuntimeError):
@@ -124,7 +143,7 @@ def _diarize_pyannote(
         if speakers
         else {"min_speakers": minimum, "max_speakers": maximum}
     )
-    result = pipeline(str(audio), **kwargs)
+    result = pipeline(load_model_waveform(audio), **kwargs)
     normal = getattr(result, "speaker_diarization", result)
     exclusive = getattr(result, "exclusive_speaker_diarization", normal)
 
@@ -150,30 +169,32 @@ def _diarize_pyannote(
 def _deepgram_segments_from_words(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build speaker segments by gluing consecutive same-speaker words: a segment
     breaks on a speaker change or a gap longer than
-    DEEPGRAM_SEGMENT_GAP. Words are consumed in response order (see deepgram_words),
-    so segments come out already sorted by start.
+    DEEPGRAM_SEGMENT_GAP. Words are consumed in response order (see deepgram_words);
+    turns are sorted only after grouping, since estimated word spans can be out of order.
     """
     segments: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     for word in words:
-        speaker = word.get("speaker")
-        if speaker is None:
+        label = deepgram_speaker_label(word)
+        if label is None:
             continue
-        label = f"SPEAKER_{int(speaker):02d}"
         start, end = float(word["start"]), float(word["end"])
+        if start == end:
+            end += MIN_WORD_SECONDS
         if (
             current is not None
             and current["speaker"] == label
             and start - current["end"] <= DEEPGRAM_SEGMENT_GAP
         ):
-            current["end"] = end
+            current["start"] = min(current["start"], start)
+            current["end"] = max(current["end"], end)
         else:
             if current is not None:
                 segments.append(current)
             current = {"start": start, "end": end, "speaker": label}
     if current is not None:
         segments.append(current)
-    return segments
+    return sorted(segments, key=lambda segment: segment["start"])
 
 
 def _diarize_deepgram(
@@ -191,6 +212,10 @@ def _diarize_deepgram(
     instead of paying twice.
     """
     data = transcribe_deepgram(audio, api_key, language, checkpoint)
+    return _write_deepgram_diarization(data, output, rttm)
+
+
+def _write_deepgram_diarization(data: dict[str, Any], output: Path, rttm: Path) -> dict[str, Any]:
     words = deepgram_words(data)
     regular = _deepgram_segments_from_words(words)
     payload = {
@@ -238,9 +263,11 @@ def detect_overlap_regions(
     single, permutation-invariant "two or more speakers active" channel that can be
     averaged across sliding windows and then binarized into regions.
     """
+    if not (model_path.is_file() or (model_path / "pytorch_model.bin").is_file()):
+        raise RuntimeError(
+            f"Local VAD model segmentation-3.0 not found at {model_path}. Run setup."
+        )
     os.environ.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"})
-    if not model_path.exists():
-        raise RuntimeError("Local VAD model segmentation-3.0 not found. Run setup.")
     try:
         import numpy as np
         import torch
@@ -259,11 +286,58 @@ def detect_overlap_regions(
         ),
     )
     inference.to(torch.device("cpu"))
-    scores = inference(str(audio))
+    scores = inference(load_model_waveform(audio))
     binarize = Binarize(onset=0.5, offset=0.5, min_duration_on=0.0, min_duration_off=0.0)
     annotation = binarize(scores)
     regions = [(float(turn.start), float(turn.end)) for turn in annotation.get_timeline().support()]
     return _filter_overlap_regions(regions)
+
+
+@contextmanager
+def _local_foxnose_pcm(audio: Path):
+    """Route diarize 0.1.2's Silero and WeSpeaker PCM reads around torchcodec.
+
+    Its public API takes a path, not a waveform or a reader. Intercept only the
+    working WAV and WeSpeaker's temporary PCM windows on this thread. The caller
+    holds _FOXNOSE_LOCK via _local_wespeaker for the whole invocation.
+    """
+    import silero_vad
+    import wespeakerruntime.speaker as speaker_module
+
+    original_read_audio = silero_vad.read_audio
+    original_torchaudio = speaker_module.torchaudio
+    audio_path = str(audio)
+    owner = get_ident()
+
+    def read_audio(path: str, sampling_rate: int = 16_000):
+        if get_ident() != owner or path != audio_path or sampling_rate != 16_000:
+            return original_read_audio(path, sampling_rate)
+        loaded = load_model_waveform(audio)
+        waveform = loaded["waveform"]
+        if loaded["sample_rate"] != sampling_rate or waveform.shape[0] != 1:
+            raise RuntimeError(f"FoxNose expects a 16 kHz mono working WAV: {audio}")
+        return waveform.squeeze(0)
+
+    class SpeakerAudio:
+        # WeSpeaker reloads diarize's PCM window WAVs via its own torchaudio binding.
+        # Keep its feature extraction unchanged without patching torchaudio.load itself.
+        @staticmethod
+        def load(wav_path: str):
+            if get_ident() != owner:
+                return original_torchaudio.load(wav_path)
+            loaded = load_model_waveform(Path(wav_path))
+            return loaded["waveform"], loaded["sample_rate"]
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(original_torchaudio, name)
+
+    silero_vad.read_audio = read_audio
+    speaker_module.torchaudio = SpeakerAudio()
+    try:
+        yield
+    finally:
+        speaker_module.torchaudio = original_torchaudio
+        silero_vad.read_audio = original_read_audio
 
 
 @contextmanager
@@ -274,16 +348,13 @@ def _local_wespeaker(model_path: Path, cpu_threads: int):
     (upstream hardcodes intra_op_num_threads=1). Both patches are restored in
     ``finally`` so the shim never leaks state, even when the wrapped call raises.
     """
-    if not model_path.exists():
+    if not model_path.is_file():
         raise RuntimeError(
             "Local WeSpeaker model not found. Run `uv run transcribe-meeting setup "
             "--diarization-provider foxnose`."
         )
     import wespeakerruntime as wsr
     from wespeakerruntime import hub as wsr_hub
-
-    original_get_model = wsr_hub.Hub.get_model_by_lang
-    original_init = wsr.Speaker.__init__
 
     def patched_get_model(lang: str) -> str:
         return str(model_path)
@@ -305,15 +376,18 @@ def _local_wespeaker(model_path: Path, cpu_threads: int):
             ),
         )
 
-    wsr_hub.Hub.get_model_by_lang = staticmethod(patched_get_model)
-    wsr.Speaker.__init__ = patched_init
-    try:
-        yield
-    finally:
-        # __get__ unwraps the descriptor to a plain function; re-wrap so instance access
-        # (Hub().get_model_by_lang(...)) keeps working exactly as it did before the shim.
-        wsr_hub.Hub.get_model_by_lang = staticmethod(original_get_model)
-        wsr.Speaker.__init__ = original_init
+    # Capture originals only after locking so overlapping runs never save each other's shim.
+    with _FOXNOSE_LOCK:
+        original_get_model = wsr_hub.Hub.get_model_by_lang
+        original_init = wsr.Speaker.__init__
+        wsr_hub.Hub.get_model_by_lang = staticmethod(patched_get_model)
+        wsr.Speaker.__init__ = patched_init
+        try:
+            yield
+        finally:
+            # Re-wrap the unbound function so instance access still works after restoring.
+            wsr_hub.Hub.get_model_by_lang = staticmethod(original_get_model)
+            wsr.Speaker.__init__ = original_init
 
 
 def _diarize_foxnose(
@@ -330,10 +404,6 @@ def _diarize_foxnose(
         import torch  # type: ignore
     except ImportError as exc:
         raise RuntimeError("PyTorch is missing: run `uv sync`.") from exc
-    torch.set_num_threads(cpu_threads)
-    # PyTorch only permits this setting before parallel work begins in a process.
-    with suppress(RuntimeError):
-        torch.set_num_interop_threads(max(1, min(4, cpu_threads // 2)))
     try:
         from diarize import diarize as foxnose_diarize
     except ImportError as exc:
@@ -343,7 +413,11 @@ def _diarize_foxnose(
         if speakers
         else {"min_speakers": minimum, "max_speakers": maximum}
     )
-    with _local_wespeaker(wespeaker_model, cpu_threads):
+    with _local_wespeaker(wespeaker_model, cpu_threads), _local_foxnose_pcm(audio):
+        torch.set_num_threads(cpu_threads)
+        # PyTorch only permits this setting before parallel work begins in a process.
+        with suppress(RuntimeError):
+            torch.set_num_interop_threads(max(1, min(4, cpu_threads // 2)))
         result = foxnose_diarize(str(audio), **kwargs)
     rows = sorted(
         (

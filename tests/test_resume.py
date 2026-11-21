@@ -120,6 +120,9 @@ def _readable_job(tmp_path, modes=("raw", "light", "readable"), readable_block=N
         raw_text="усвол материал",
         confidence={},
         light_text="усвол материал.",
+        readable_text="Усвоил материал."
+        if (readable_block or {}).get("status") == "complete"
+        else None,
     )
     atomic_json(
         job / "canonical.json",
@@ -200,6 +203,93 @@ def test_resume_does_not_repeat_a_readable_pass_that_already_completed(
 
     assert result.exit_code == 0, result.output
     assert calls == []
+    assert "Усвоил материал." in (job / "transcript.readable.md").read_text(encoding="utf-8")
+    assert (job / "review" / "readable_changes.csv").is_file()
+
+
+def test_resume_restores_readable_added_with_clean(tmp_path, monkeypatch):
+    job = _readable_job(tmp_path, modes=("raw", "light"))
+    calls = _stub_readable_pass(monkeypatch)
+    runner = CliRunner()
+    result = runner.invoke(app, ["clean", str(job), "--mode", "readable"])
+    assert result.exit_code == 0, result.output
+    for name in ("transcript.readable.md", "review/readable_changes.csv"):
+        (job / name).unlink()
+
+    result = runner.invoke(app, ["resume", str(job)])
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["gpt-test"]
+    assert (job / "transcript.readable.md").is_file()
+    assert (job / "review/readable_changes.csv").is_file()
+
+
+def test_resume_keeps_published_text_without_original_recording(tmp_path):
+    job = _readable_job(tmp_path, modes=("raw", "light"))
+    complete_stage(job, "align", {"word_timestamp_schema": 1})
+    before = (job / "canonical.json").read_bytes()
+
+    outcome = CliRunner().invoke(app, ["resume", str(job)])
+
+    assert outcome.exit_code == 0, outcome.output
+    assert (job / "canonical.json").read_bytes() == before
+    assert read_json(job / "result.json")["utterances"] == 1
+
+
+def test_resume_does_not_reprocess_legacy_job_missing_canonical(tmp_path):
+    job = _readable_job(tmp_path, modes=("raw", "light"))
+    (job / "canonical.json").unlink()
+    atomic_json(job / "result.json", {"status": "complete", "utterances": 1})
+
+    outcome = CliRunner().invoke(app, ["resume", str(job)])
+
+    assert outcome.exit_code == 1
+    assert "Restore it from backup" in outcome.stderr
+
+
+def test_resume_rejects_modified_published_canonical_without_losing_exports(tmp_path):
+    from transcribe_meeting.job import mark_published
+
+    job = _readable_job(tmp_path, modes=("raw", "light"))
+    mark_published(job)
+    output = job / "transcript.raw.v3_rnnt.md"
+    output.write_text("Previous accepted transcript", encoding="utf-8")
+    canonical = read_json(job / "canonical.json")
+    canonical["utterances"] = []
+    atomic_json(job / "canonical.json", canonical)
+
+    outcome = CliRunner().invoke(app, ["resume", str(job)])
+
+    assert outcome.exit_code == 1
+    assert "Restore it from backup" in outcome.stderr
+    assert output.read_text(encoding="utf-8") == "Previous accepted transcript"
+
+
+def test_clean_does_not_mark_a_manifest_only_job_complete(tmp_path):
+    job = _readable_job(tmp_path)
+    (job / "canonical.json").unlink()
+
+    outcome = CliRunner().invoke(app, ["clean", str(job), "--mode", "readable"])
+
+    assert outcome.exit_code == 2
+    assert not (job / "result.json").exists()
+
+
+def test_resume_keeps_manual_text_with_damaged_alignment_marker(tmp_path):
+    from transcribe_meeting.job import mark_published
+
+    job = _readable_job(tmp_path, modes=("raw", "light"))
+    canonical = read_json(job / "canonical.json")
+    canonical["utterances"][0]["raw_text"] = "Ручное исправление"
+    atomic_json(job / "canonical.json", canonical)
+    mark_published(job)
+    (job / ".stages" / "align.json").write_text("{", encoding="utf-8")
+
+    outcome = CliRunner().invoke(app, ["resume", str(job)])
+
+    assert outcome.exit_code == 0, outcome.output
+    assert read_json(job / "canonical.json") == canonical
+    assert "Ручное исправление" in (job / "transcript.raw.v3_rnnt.md").read_text(encoding="utf-8")
 
 
 def test_resume_retries_a_readable_pass_that_previously_failed(tmp_path, monkeypatch, stub_run_job):

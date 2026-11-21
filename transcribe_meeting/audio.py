@@ -31,11 +31,28 @@ COMPRESSION_4_TO_1 = {
 }
 
 
+def wav_duration(path: Path) -> float:
+    """Return the duration of the decoded audio, not the container's declared duration."""
+    with wave.open(str(path), "rb") as handle:
+        return handle.getnframes() / handle.getframerate()
+
+
+def load_model_waveform(path: Path) -> dict[str, Any]:
+    """Read a working PCM WAV as channel-first float32, without torchcodec."""
+    import soundfile as sf
+    import torch
+
+    samples, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    # The transpose is a view; the usual mono WAV needs no additional PCM buffer.
+    return {"waveform": torch.from_numpy(samples.T), "sample_rate": sample_rate}
+
+
 def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, text=True, capture_output=True, check=False)
 
 
 def probe(path: Path, audio_stream: int | None = None) -> dict[str, Any]:
+    path = path.resolve()
     result = run_command(
         ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)]
     )

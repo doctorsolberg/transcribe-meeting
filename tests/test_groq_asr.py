@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from transcribe_meeting import asr
-from transcribe_meeting.util import atomic_json, read_json
+from transcribe_meeting.util import read_json
 
 
 def _wav(path, *, seconds: int = 1, rate: int = 16_000) -> None:
@@ -26,7 +26,11 @@ def test_groq_transcription_uses_openai_compatible_endpoint(tmp_path, monkeypatc
 
     class Response:
         def model_dump(self):
-            return {"text": "тест", "segments": [], "words": []}
+            return {
+                "text": "тест",
+                "segments": [],
+                "words": [{"word": "тест", "start": 0, "end": 1}],
+            }
 
     class Transcriptions:
         def create(self, **kwargs):
@@ -38,7 +42,11 @@ def test_groq_transcription_uses_openai_compatible_endpoint(tmp_path, monkeypatc
             seen["client"] = kwargs
             self.audio = types.SimpleNamespace(transcriptions=Transcriptions())
 
-    fake_openai = types.SimpleNamespace(OpenAI=OpenAI, APIStatusError=RuntimeError)
+    from openai import DefaultHttpxClient
+
+    fake_openai = types.SimpleNamespace(
+        OpenAI=OpenAI, APIStatusError=RuntimeError, DefaultHttpxClient=DefaultHttpxClient
+    )
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
 
@@ -48,6 +56,34 @@ def test_groq_transcription_uses_openai_compatible_endpoint(tmp_path, monkeypatc
     assert seen["model"] == "whisper-large-v3"
     assert seen["timestamp_granularities"] == ["segment", "word"]
     assert read_json(output)["run_parameters"]["provider"] == "groq"
+
+
+def test_groq_does_not_forward_upload_or_openai_headers(tmp_path, monkeypatch):
+    import httpx
+
+    audio = tmp_path / "part.wav"
+    _wav(audio)
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_ORG_ID", "test-org")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "test-project")
+    requests = []
+
+    def redirect(_client, request):
+        requests.append(request)
+        if request.url.host == "api.groq.com":
+            return httpx.Response(
+                307, headers={"Location": "https://other.test/upload"}, request=request
+            )
+        return httpx.Response(401, request=request)
+
+    monkeypatch.setattr(httpx.Client, "_send_single_request", redirect)
+
+    with pytest.raises(RuntimeError, match="HTTP"):
+        asr._request_groq(audio, "ru", "private context", None)
+
+    assert [request.url.host for request in requests] == ["api.groq.com"]
+    assert "OpenAI-Organization" not in requests[0].headers
+    assert "OpenAI-Project" not in requests[0].headers
 
 
 def test_groq_prompt_keeps_beginning_and_latest_context():
@@ -66,13 +102,11 @@ def test_groq_provider_caps_chunk_duration_to_ten_minutes(tmp_path, monkeypatch)
     output = tmp_path / "asr" / "001.json"
     requests = []
 
-    def fake_groq(chunk, destination, *_args, **_kwargs):
-        from transcribe_meeting.util import atomic_json
-
+    def fake_groq(chunk, *_args):
         requests.append(asr._wav_duration(chunk))
-        atomic_json(destination, {"text": "", "segments": [], "words": []})
+        return {"text": "", "segments": [], "words": []}
 
-    monkeypatch.setattr(asr, "_transcribe_groq", fake_groq)
+    monkeypatch.setattr(asr, "_request_groq", fake_groq)
     asr.transcribe_part(
         audio,
         output,
@@ -97,13 +131,13 @@ def test_groq_transcribe_part_validates_a_real_response_and_tolerates_its_overla
         (Path(__file__).parent / "fixtures" / "groq_words.json").read_text(encoding="utf-8")
     )
     audio = tmp_path / "part.wav"
-    _wav(audio, seconds=20, rate=1)
+    _wav(audio, seconds=20)
     output = tmp_path / "asr" / "001.json"
 
-    def fake_groq(chunk, destination, *_args, **_kwargs):
-        atomic_json(destination, {"text": "", "segments": [], "words": fixture["words"]})
+    def fake_groq(chunk, *_args):
+        return {"text": "", "segments": [], "words": fixture["words"]}
 
-    monkeypatch.setattr(asr, "_transcribe_groq", fake_groq)
+    monkeypatch.setattr(asr, "_request_groq", fake_groq)
 
     combined = asr.transcribe_part(audio, output, None, "ru", "", provider="groq")
 
@@ -117,17 +151,14 @@ def test_groq_transcribe_part_rejects_a_word_outside_chunk_bounds(tmp_path, monk
     _wav(audio, seconds=5, rate=1)
     output = tmp_path / "asr" / "001.json"
 
-    def fake_groq(chunk, destination, *_args, **_kwargs):
-        atomic_json(
-            destination,
-            {
-                "text": "",
-                "segments": [],
-                "words": [{"word": "край", "start": 4.0, "end": 50.0, "confidence": 0.9}],
-            },
-        )
+    def fake_groq(chunk, *_args):
+        return {
+            "text": "",
+            "segments": [],
+            "words": [{"word": "край", "start": 4.0, "end": 50.0, "confidence": 0.9}],
+        }
 
-    monkeypatch.setattr(asr, "_transcribe_groq", fake_groq)
+    monkeypatch.setattr(asr, "_request_groq", fake_groq)
 
     with pytest.raises(ValueError):
         asr.transcribe_part(audio, output, None, "ru", "", provider="groq")
@@ -162,12 +193,14 @@ def _groq_client_raising(sequence):
 
 
 def _install_groq(monkeypatch, client):
+    from openai import DefaultHttpxClient
+
     from transcribe_meeting import asr
 
     monkeypatch.setenv("GROQ_API_KEY", "k")
-    fake_openai = types.ModuleType("openai")
-    fake_openai.OpenAI = lambda **_: client
-    fake_openai.APIStatusError = _Status429
+    fake_openai = types.SimpleNamespace(
+        OpenAI=lambda **_: client, APIStatusError=_Status429, DefaultHttpxClient=DefaultHttpxClient
+    )
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
     return asr
 
@@ -180,7 +213,13 @@ def test_groq_retries_a_429_and_honours_retry_after(tmp_path, monkeypatch):
         handle.setsampwidth(2)
         handle.setframerate(16_000)
         handle.writeframes(b"\0\0" * 16_000)
-    ok = types.SimpleNamespace(model_dump=lambda: {"text": "ок", "segments": [], "words": []})
+    ok = types.SimpleNamespace(
+        model_dump=lambda: {
+            "text": "ок",
+            "segments": [],
+            "words": [{"word": "ок", "start": 0, "end": 1}],
+        }
+    )
     client, calls = _groq_client_raising([_Status429(retry_after="4"), ok])
     asr = _install_groq(monkeypatch, client)
     slept = []

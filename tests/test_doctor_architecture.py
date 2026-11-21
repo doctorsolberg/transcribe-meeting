@@ -1,11 +1,27 @@
 import json
 import platform
 
+import pytest
 from typer.testing import CliRunner
 
 from transcribe_meeting.cli import app
 
 runner = CliRunner()
+
+
+@pytest.mark.parametrize("contents", [b"{", b"[]", b'{"models":{"vad":[]}}'])
+def test_doctor_reports_invalid_model_lock_as_json(tmp_path, monkeypatch, contents):
+    models = tmp_path / "models"
+    models.mkdir()
+    (models / "models.lock.json").write_bytes(contents)
+    monkeypatch.setenv("TRANSCRIBE_HOME", str(tmp_path))
+    monkeypatch.setenv("TRANSCRIBE_MODELS_DIR", str(models))
+
+    outcome = runner.invoke(app, ["doctor"])
+
+    assert outcome.exit_code == 1
+    assert json.loads(outcome.stdout)["route_ready"] is False
+    assert "models.lock.json" in outcome.stderr
 
 
 def test_doctor_does_not_fail_on_a_non_apple_silicon_machine(monkeypatch):
@@ -21,8 +37,30 @@ def test_doctor_does_not_fail_on_a_non_apple_silicon_machine(monkeypatch):
     # the exit code is asserted against the checks doctor itself gates on rather than
     # against 0: on a machine without models (CI, a fresh checkout) route_ready is
     # legitimately false, and hard-coding 0 would make this test pass only here.
-    gating = ("python_supported", "ffmpeg", "free_space_ge_7gb", "route_ready")
+    gating = ("python_supported", "ffmpeg", "route_ready")
     assert result.exit_code == (0 if all(checks[key] for key in gating) else 1)
+
+
+def test_doctor_accepts_a_ready_route_without_space_for_new_downloads(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRANSCRIBE_ENV_FILE", str(tmp_path / "settings.env"))
+    monkeypatch.setattr("transcribe_meeting.cli._free_space_bytes", lambda _path: 1024**3)
+    monkeypatch.setattr("transcribe_meeting.cli.shutil.which", lambda _name: "/path/to/binary")
+    monkeypatch.setattr(
+        "transcribe_meeting.cli.route_readiness",
+        lambda *_args: {
+            "local_asr_models": {"v3_rnnt": True},
+            "asr_keys": {},
+            "vad_ready": True,
+            "diarization_ready": True,
+            "route_ready": True,
+            "problems": [],
+        },
+    )
+
+    outcome = runner.invoke(app, ["doctor"])
+
+    assert outcome.exit_code == 0, outcome.output
+    assert json.loads(outcome.stdout)["free_space_ge_7gb"] is False
 
 
 def test_doctor_survives_a_data_root_that_does_not_exist_yet(monkeypatch, tmp_path):
