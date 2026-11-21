@@ -18,6 +18,9 @@ Budget at least 7 GiB of free space on the model volume for initial setup. `doct
 uv sync --locked --python 3.12 --no-dev
 ```
 
+To keep models and results outside the checkout, set `TRANSCRIBE_HOME` in `.env`
+before running `setup`. See [Data directories](#data-directories).
+
 1. Sign in to Hugging Face and accept the terms or request access for [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0). Create a Read token on the same account; if you use a fine-grained token, grant it read access to the required gated repositories. A token does not grant access your account has not already been given.
 2. Export `HF_TOKEN` or store it in the project's `.env` with `auth set huggingface` (hidden prompt). Skip the prompt if the token is already configured. Hub CLI login alone is not a substitute for supplying `HF_TOKEN` to this app.
 3. Install the default models and check the route:
@@ -76,7 +79,8 @@ Set these overrides in the environment or the project's `.env`:
 
 ## Files and corrections
 
-Jobs are stored in `output/` by default:
+Jobs are stored in `<data-root>/output/` by default. Use the job path printed by `run`
+in place of `output/JOB` in the examples below if you use a separate data directory.
 
 | File | Contents |
 |---|---|
@@ -103,9 +107,27 @@ Text corrected with `refine` is kept verbatim in subsequent `readable` passes.
 
 ## Data directories
 
-`output/`, `models/`, `glossary.yaml` and `.env` are relative to the current directory unless `TRANSCRIBE_HOME` or `--data-root` is set. `TRANSCRIBE_OUTPUT_DIR`, `TRANSCRIBE_MODELS_DIR` and `TRANSCRIBE_ENV_FILE` override individual paths. Put global flags before the command. Use the same data root for `setup`, `run`, and `resume`.
+By default, `models/`, `output/` and `glossary.yaml` are under the working directory.
+To use a separate data root without passing `--data-root` every time, copy
+[`.env.example`](.env.example) to `.env` in the directory you run from, set
+`TRANSCRIBE_HOME=/absolute/path/to/transcribe-data` in that file, and restrict it to
+owner access (`chmod 600 .env`). Use the same data root for `setup`, `run`, and `resume`.
 
-`auth` writes an owner-only `.env`; the CLI reads only supported settings from it. Environment values take precedence. Configure a custom `OPENAI_BASE_URL` and its key together in the environment or in the same trusted `.env`; the CLI rejects an `.env` endpoint for another origin when only the key comes from the environment. If copying [`.env.example`](.env.example), restrict your copy to owner access (`chmod 600 .env`) before adding secrets.
+Data root precedence: `--data-root` → exported `TRANSCRIBE_HOME` → `TRANSCRIBE_HOME`
+in the selected `.env` → working directory. To select the `.env`, the CLI uses the
+exported `TRANSCRIBE_ENV_FILE` if set; otherwise it looks in the explicit data root
+from the flag or shell, or in the working directory if neither was specified.
+Changing the data root from inside `.env` does not switch to another `.env`.
+
+Use `--models-dir` or exported `TRANSCRIBE_MODELS_DIR` to override just the models,
+and `--output-dir` or exported `TRANSCRIBE_OUTPUT_DIR` to override just the output.
+Put global flags before the command. Recording paths are still passed to `run`;
+they are not resolved relative to the data root, and no input directory is scanned.
+
+`auth` writes to the selected `.env` with owner-only permissions. The CLI reads only
+supported settings from it. Configure a custom `OPENAI_BASE_URL` and its key together
+in the shell environment or in the same trusted `.env`; the CLI rejects an `.env`
+endpoint for another origin when only the key comes from the environment.
 
 When switching providers with `auth set-openai-base-url`, remove the old `OPENAI_API_KEY` from the project's `.env` first, then save the new endpoint and its key.
 
@@ -118,7 +140,7 @@ Use `transcribe-meeting COMMAND --help` for current defaults and usage.
 | Option | Default | Purpose |
 |---|---|---|
 | `--version` | off | Print the installed version and exit. |
-| `--data-root` | current working directory | Project data root; overrides `TRANSCRIBE_HOME`. |
+| `--data-root` | `TRANSCRIBE_HOME` from the shell or `.env`, otherwise the working directory | Project data root. |
 | `--output-dir` | `<data-root>/output` | Job directory; overrides `TRANSCRIBE_OUTPUT_DIR`. |
 | `--models-dir` | `<data-root>/models` | Models directory; overrides `TRANSCRIBE_MODELS_DIR`. |
 

@@ -87,6 +87,7 @@ def _print_version(value: bool) -> None:
 
 @app.callback()
 def main(
+    ctx: typer.Context,
     version: Annotated[
         bool | None,
         typer.Option(
@@ -100,9 +101,9 @@ def main(
         Path | None,
         typer.Option(
             "--data-root",
-            help="Project data root: output/, models/, glossary.yaml, and .env live here "
-            "by default. Defaults to the current working directory; overrides the "
-            f"{paths.ENV_DATA_ROOT} environment variable.",
+            help="Project data root for output/, models/, and glossary.yaml. Overrides "
+            f"{paths.ENV_DATA_ROOT} from the environment or .env. "
+            "Falls back to the working directory.",
         ),
     ] = None,
     output_dir: Annotated[
@@ -129,7 +130,10 @@ def main(
         os.environ[paths.ENV_OUTPUT_DIR] = str(output_dir)
     if models_dir is not None:
         os.environ[paths.ENV_MODELS_DIR] = str(models_dir)
-    load_project_secrets(paths.secrets_path())
+    # The selected .env may itself set TRANSCRIBE_HOME. Keep using that same file for auth.
+    settings = paths.secrets_path()
+    ctx.obj = settings
+    load_project_secrets(settings)
 
 
 def _parse_clean(value: str) -> list[str]:
@@ -546,6 +550,7 @@ def _print_run_configuration(
 
 @auth_app.command("set")
 def set_api_key(
+    ctx: typer.Context,
     provider: Annotated[str, typer.Argument(help="openai, groq, deepgram, or huggingface.")],
 ) -> None:
     """Save an OpenAI/Groq/Deepgram API key or HF_TOKEN to the project's protected .env."""
@@ -560,7 +565,7 @@ def set_api_key(
     name = names[provider]
     value = getpass(f"{name}: ").strip()
     try:
-        save_project_secret(name, value)
+        save_project_secret(name, value, path=ctx.obj)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     os.environ[name] = value
@@ -568,11 +573,11 @@ def set_api_key(
 
 
 @auth_app.command("set-openai-base-url")
-def set_openai_base_url() -> None:
+def set_openai_base_url(ctx: typer.Context) -> None:
     """Save an OpenAI-compatible API URL to the project's .env."""
     try:
         value = validate_readable_base_url(input("OPENAI_BASE_URL: "))
-        save_project_secret("OPENAI_BASE_URL", value)
+        save_project_secret("OPENAI_BASE_URL", value, path=ctx.obj)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
     os.environ["OPENAI_BASE_URL"] = value

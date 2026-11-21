@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from transcribe_meeting import paths
@@ -11,6 +12,7 @@ runner = CliRunner()
 
 def test_data_root_defaults_to_cwd_and_output_models_glossary_follow_it(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(paths.ENV_SECRETS_FILE, raising=False)
     assert paths.data_root() == tmp_path
     assert paths.output_dir() == tmp_path / "output"
     assert paths.models_dir() == tmp_path / "models"
@@ -142,3 +144,62 @@ def test_cli_models_dir_option_is_independent_of_data_root(tmp_path, monkeypatch
 
     checks, _ = json.JSONDecoder().raw_decode(result.stdout)
     assert checks["asr_models"] == {"v3_rnnt": True}
+
+
+@pytest.mark.parametrize("custom_file", [False, True])
+@pytest.mark.parametrize("shell_root", [None, ""])
+def test_cli_uses_dotenv_data_root(tmp_path, monkeypatch, custom_file, shell_root):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(paths.ENV_SECRETS_FILE, raising=False)
+    if shell_root is None:
+        monkeypatch.delenv(paths.ENV_DATA_ROOT, raising=False)
+    else:
+        monkeypatch.setenv(paths.ENV_DATA_ROOT, shell_root)
+    data = tmp_path / "meeting data"
+    settings = tmp_path / ("custom.env" if custom_file else ".env")
+    settings.write_text(f'TRANSCRIBE_HOME="{data}"\n', encoding="utf-8")
+    if custom_file:
+        monkeypatch.setenv(paths.ENV_SECRETS_FILE, str(settings))
+    checkpoints = data / "models" / "gigaam"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "v3_rnnt.ckpt").write_bytes(b"stub checkpoint")
+
+    result = runner.invoke(app, ["doctor", "--asr-models", "v3_rnnt"])
+
+    assert json.loads(result.stdout)["asr_models"] == {"v3_rnnt": True}
+    assert paths.output_dir() == data / "output"
+
+
+@pytest.mark.parametrize("use_flag", [False, True])
+def test_cli_flag_and_shell_override_dotenv_data_root(tmp_path, monkeypatch, use_flag):
+    settings = tmp_path / "custom.env"
+    settings.write_text(f"TRANSCRIBE_HOME={tmp_path / 'from-dotenv'}\n", encoding="utf-8")
+    monkeypatch.setenv(paths.ENV_SECRETS_FILE, str(settings))
+    shell = tmp_path / "from-shell"
+    flag = tmp_path / "from-flag"
+    monkeypatch.setenv(paths.ENV_DATA_ROOT, str(shell))
+    flags = ["--data-root", str(flag)] if use_flag else []
+
+    result = runner.invoke(app, [*flags, "glossary", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert paths.data_root() == (flag if use_flag else shell)
+
+
+def test_auth_writes_to_the_dotenv_that_selected_the_data_root(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(paths.ENV_SECRETS_FILE, raising=False)
+    monkeypatch.setenv(paths.ENV_DATA_ROOT, "")
+    monkeypatch.delenv(paths.ENV_DATA_ROOT)
+    monkeypatch.setenv("HF_TOKEN", "")
+    data = tmp_path / "data"
+    settings = tmp_path / ".env"
+    settings.write_text(f"TRANSCRIBE_HOME={data}\n", encoding="utf-8")
+    monkeypatch.setattr("transcribe_meeting.cli.getpass", lambda _: "hf_example")
+
+    result = runner.invoke(app, ["auth", "set", "huggingface"])
+
+    assert result.exit_code == 0, result.output
+    assert paths.data_root() == data
+    assert settings.read_text(encoding="utf-8") == f"TRANSCRIBE_HOME={data}\nHF_TOKEN=hf_example\n"
+    assert not (data / ".env").exists()

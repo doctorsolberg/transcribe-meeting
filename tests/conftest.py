@@ -20,6 +20,9 @@ _LOCATION_ENV = (
 
 
 @pytest.fixture(autouse=True)
-def _isolate_location_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_location_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     for name in _LOCATION_ENV:
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    # Test CLI calls from the checkout must never read the developer's real .env.
+    monkeypatch.setenv("TRANSCRIBE_ENV_FILE", str(tmp_path / "no-project.env"))
