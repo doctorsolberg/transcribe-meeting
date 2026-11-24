@@ -14,9 +14,11 @@ from .paths import ENV_DATA_ROOT, secrets_path
 SECRET_NAMES = {"OPENAI_API_KEY", "GROQ_API_KEY", "DEEPGRAM_API_KEY", "HF_TOKEN"}
 PROJECT_ENV_NAMES = SECRET_NAMES | {"OPENAI_BASE_URL"}
 OPENAI_ENV_CONFLICT = "_TRANSCRIBE_OPENAI_ENV_CONFLICT"
+READABLE_MODEL_ENV = "TRANSCRIBE_READABLE_MODEL"
 _OPENAI_NAMES = {"OPENAI_API_KEY", "OPENAI_BASE_URL"}
 _OPTION_NAMES = {
     ENV_DATA_ROOT,
+    READABLE_MODEL_ENV,
     "TRANSCRIBE_READABLE_API",
     "TRANSCRIBE_READABLE_RESPONSE_FORMAT",
     "TRANSCRIBE_READABLE_BATCH_SIZE",
@@ -66,7 +68,7 @@ def load_project_secrets(
         if (name in PROJECT_ENV_NAMES or name in _OPTION_NAMES) and (value := _value(raw).strip()):
             project.setdefault(name, value)
     for name, value in project.items():
-        if name == ENV_DATA_ROOT and not target.get(name):
+        if name in {ENV_DATA_ROOT, READABLE_MODEL_ENV} and not target.get(name):
             target[name] = value
         elif name not in _OPENAI_NAMES:
             target.setdefault(name, value)

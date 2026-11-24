@@ -59,12 +59,18 @@ from .diarization import DEEPGRAM_REPO, DIARIZATION_PROVIDERS, FOXNOSE_REPO, PYA
 from .readable import readable_readiness, validate_readable_base_url
 from .readable_publish import job_transaction, recover_readable_publication
 from .result import write_job_result
-from .secrets import PROJECT_ENV_NAMES, load_project_secrets, save_project_secret
+from .secrets import (
+    PROJECT_ENV_NAMES,
+    READABLE_MODEL_ENV,
+    load_project_secrets,
+    save_project_secret,
+)
 from .util import read_json
 
 #: Interpreters the project is tested against: both resolve the lock and pass the
 #: full suite. Model inference itself has only been exercised on 3.12 (see README).
 SUPPORTED_PYTHON = ((3, 12), (3, 13))
+DEFAULT_READABLE_MODEL = "gpt-6.2-sol"
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -409,7 +415,7 @@ def _resolved_run_config(
     asr_preprocess: str,
     asr_compression: str,
     context_prompt: str,
-    llm_model: str,
+    llm_model: str | None,
     asr_device: str = "auto",
     diarization_provider: str = "foxnose",
     asr_models: list[str] | None = None,
@@ -466,7 +472,7 @@ def _resolved_run_config(
         "asr_preprocess": asr_preprocess,
         "asr_compression": asr_compression,
         "context_prompt": context_prompt.strip(),
-        "llm_model": llm_model,
+        "llm_model": llm_model or os.environ.get(READABLE_MODEL_ENV) or DEFAULT_READABLE_MODEL,
     }
 
 
@@ -929,9 +935,9 @@ def run(
         f"diarization; if {GROQ_ASR_MODEL_NAME} is among --asr-models, it is additionally "
         "passed as a prompt hint to the Whisper API transcription.",
     ),
-    llm_model: str = typer.Option(
-        "gpt-5.6-luna",
-        help="Model ID for clean --mode readable; e.g. gpt-5.6-luna or gpt-5.6-terra.",
+    llm_model: str | None = typer.Option(
+        None,
+        help=f"Readable model ID: {READABLE_MODEL_ENV} or {DEFAULT_READABLE_MODEL} by default.",
     ),
     measure_loudness: bool = typer.Option(
         False,
@@ -1166,7 +1172,10 @@ def clean(
     mode: str = typer.Option(
         ..., help="What to re-render: raw, light, readable, or several comma-separated."
     ),
-    llm_model: str | None = typer.Option(None, help="Override the LLM only for this readable run."),
+    llm_model: str | None = typer.Option(
+        None,
+        help=f"Model ID for this readable pass. Defaults to {READABLE_MODEL_ENV} or the job model.",
+    ),
 ) -> None:
     """Re-render raw/light or run the requested LLM cleanup."""
     _require_job_dir(job_dir)
@@ -1177,7 +1186,9 @@ def clean(
             raise typer.BadParameter("This job has no transcript yet. Run resume first.")
         if local_modes:
             render_all(job_dir, local_modes)
-    success = "readable" not in modes or try_readable(job_dir, llm_model)
+    success = "readable" not in modes or try_readable(
+        job_dir, llm_model or os.environ.get(READABLE_MODEL_ENV)
+    )
     with job_transaction(job_dir):
         write_job_result(job_dir)
     if not success:

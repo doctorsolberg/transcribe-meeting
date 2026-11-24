@@ -11,17 +11,18 @@ from __future__ import annotations
 
 import pytest
 
-_LOCATION_ENV = (
+_PROJECT_ENV = (
     "TRANSCRIBE_HOME",
     "TRANSCRIBE_OUTPUT_DIR",
     "TRANSCRIBE_MODELS_DIR",
     "TRANSCRIBE_ENV_FILE",
+    "TRANSCRIBE_READABLE_MODEL",
 )
 
 
 @pytest.fixture(autouse=True)
-def _isolate_location_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    for name in _LOCATION_ENV:
+def _isolate_project_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    for name in _PROJECT_ENV:
         monkeypatch.setenv(name, "")
         monkeypatch.delenv(name)
     # Test CLI calls from the checkout must never read the developer's real .env.

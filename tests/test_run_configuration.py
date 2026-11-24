@@ -82,13 +82,17 @@ def test_startup_configuration_accepts_an_explicit_single_model():
     assert config["asr_models"] == ["v3_rnnt"]
 
 
-def test_default_readable_model_is_luna():
-    """Owner's choice: luna edits more freely, and the change log keeps it reviewable."""
-    import inspect
+def test_default_readable_model_is_sol(monkeypatch):
+    monkeypatch.delenv("TRANSCRIBE_READABLE_MODEL", raising=False)
 
-    from transcribe_meeting.cli import run
+    assert _config(llm_model=None)["llm_model"] == "gpt-6.2-sol"
 
-    assert inspect.signature(run).parameters["llm_model"].default.default == "gpt-5.6-luna"
+
+def test_run_model_option_overrides_the_environment_default(monkeypatch):
+    monkeypatch.setenv("TRANSCRIBE_READABLE_MODEL", "provider/model")
+
+    assert _config(llm_model=None)["llm_model"] == "provider/model"
+    assert _config(llm_model="explicit-model")["llm_model"] == "explicit-model"
 
 
 def test_startup_configuration_resolves_deepgram_diarization_model():

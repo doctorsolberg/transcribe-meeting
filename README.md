@@ -70,10 +70,15 @@ Set these overrides in the environment or the project's `.env`:
 
 | Setting | When to change it |
 |---|---|
+| `TRANSCRIBE_READABLE_MODEL` | Default model ID for `run` and explicit `clean --mode readable`. Use an ID available on your endpoint. |
 | `TRANSCRIBE_READABLE_API` | `responses` (default) or `chat` for servers that expose Chat Completions only. |
 | `TRANSCRIBE_READABLE_RESPONSE_FORMAT` | `json_schema` (default) or `json_object` if the server cannot enforce a schema. The CLI validates both locally. |
-| `TRANSCRIBE_READABLE_BATCH_SIZE` | Reduce the default of 150 utterances for a smaller context window. |
+| `TRANSCRIBE_READABLE_BATCH_SIZE` | Utterances per LLM request (positive integer, default: 150). Lower it for smaller context windows or truncated replies. |
 | `TRANSCRIBE_READABLE_REASONING` | `none` omits the field. `low`, `medium`, `high` request a level only if the server supports it. Default: `medium` on Responses, omitted on Chat Completions. |
+
+`--llm-model` overrides the setting for that invocation. If both are unset, `run`
+uses `gpt-6.2-sol` and `clean` uses the model saved in the job. `resume` always uses
+the saved model for an unfinished readable pass.
 
 `readable` combines ASR variants, restores punctuation and can change words. Check names, numbers, and important quotes against the recording. If a batch fails, a first readable export can be `partial`: it includes local fallback text. A partial pass never replaces an already accepted complete version. Check `readable.status` in `result.json` and inspect `review/readable_changes.csv` when present. Use `clean --mode readable` to retry a partial pass; `resume` does not repeat it automatically. A silent job sends no text to the LLM.
 
@@ -172,7 +177,7 @@ Argument: `parts` (one or more meeting files, required).
 | `--asr-preprocess` | `none` | Preprocessing for ASR and diarization: `none` or `hpf80-preemphasis`. |
 | `--asr-compression` | `none` | Compression for ASR and diarization: `none` or `4:1`. |
 | `--context-prompt` | `""` (up to 2,000 characters) | Meeting topic and purpose; kept in the job configuration and used as a hint for `readable` and Groq, when enabled. |
-| `--llm-model` | `gpt-5.6-luna` | LLM model ID for this job's `readable` pass. |
+| `--llm-model` | `TRANSCRIBE_READABLE_MODEL` or `gpt-6.2-sol` | LLM model ID saved for this job's `readable` pass. |
 | `--measure-loudness` / `--no-measure-loudness` | `no-measure-loudness` | Measure LUFS/true peak; lengthens the run, doesn't affect recognition. |
 
 ### `setup`
@@ -190,7 +195,7 @@ Argument: `job_dir` (folder of a finished job, required).
 | Option | Default | Purpose |
 |---|---|---|
 | `--mode` | required | What to re-render: `raw`, `light`, `readable`, or several comma-separated. |
-| `--llm-model` | not set (read from the manifest) | Override the LLM only for this `readable` run. |
+| `--llm-model` | `TRANSCRIBE_READABLE_MODEL` or the model saved in the job | Override the LLM only for this `readable` pass. |
 
 ### `rename`
 

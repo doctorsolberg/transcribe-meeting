@@ -155,6 +155,24 @@ def _stub_readable_pass(monkeypatch, *, fail=False):
     return calls
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_clean_honors_dotenv_readable_model_unless_passed_explicitly(
+    tmp_path, monkeypatch, explicit
+):
+    job = _readable_job(tmp_path)
+    calls = _stub_readable_pass(monkeypatch)
+    settings = tmp_path / "settings.env"
+    settings.write_text("TRANSCRIBE_READABLE_MODEL=gpt-6.2-sol\n", encoding="utf-8")
+    monkeypatch.setenv("TRANSCRIBE_ENV_FILE", str(settings))
+    flags = ["--llm-model", "override-model"] if explicit else []
+
+    result = CliRunner().invoke(app, ["clean", str(job), "--mode", "readable", *flags])
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["override-model" if explicit else "gpt-6.2-sol"]
+    assert read_json(job / "manifest.json")["config"]["llm_model"] == "gpt-test"
+
+
 @pytest.fixture
 def stub_run_job(monkeypatch):
     """resume's local stages are checkpointed already; only the readable pass matters."""
@@ -166,6 +184,7 @@ def test_resume_runs_the_readable_pass_when_the_job_was_interrupted_before_it(
 ):
     job = _readable_job(tmp_path)
     calls = _stub_readable_pass(monkeypatch)
+    monkeypatch.setenv("TRANSCRIBE_READABLE_MODEL", "new-default")
 
     result = CliRunner().invoke(app, ["resume", str(job)])
 

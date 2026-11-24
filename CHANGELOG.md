@@ -10,6 +10,7 @@ versioning — [Semantic Versioning](https://semver.org/).
 - `readable` supports OpenAI-compatible Chat Completions, JSON object mode, and a configurable batch size. The default remains Responses with strict JSON schema.
 - `setup` shows download progress and accepts a trusted HTTPS mirror for GigaAM checkpoints.
 - `TRANSCRIBE_HOME` can be set in `.env` to keep models and results outside the checkout without passing `--data-root` on every run.
+- Set `TRANSCRIBE_READABLE_MODEL` in `.env` to choose the default LLM for `run` and `clean`; new jobs default to `gpt-6.2-sol`.
 - `setup --with-vad` provisions optional overlap detection for network-only ASR. A complete local model cache can be verified without Hub access or an HF token.
 
 ### Changed
